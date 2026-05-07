@@ -333,7 +333,7 @@ class HostsModel(QAbstractTableModel):
 
         if role == Qt.DisplayRole:
             if key == "status":
-                return "🟢 Online" if host.alive else "🔴 Offline"
+                return "Online" if host.alive else "Offline"
             if key == "ip":
                 return host.ip
             if key == "hostname":
@@ -831,13 +831,13 @@ class ScanTab(QWidget):
         if not text:
             return
         QApplication.clipboard().setText(text)
-        self.status_label.setText(f"✓ Скопировано: {what}")
+        self.status_label.setText(f"Скопировано: {what}")
         QTimer.singleShot(2500, self._restore_status_label)
 
     def _restore_status_label(self) -> None:
-        # Only revert the "✓ Скопировано: …" notice; never overwrite an
+        # Only revert the "Скопировано: …" notice; never overwrite an
         # in-progress / finished scan status that the worker has set.
-        if self.status_label.text().startswith("✓ Скопировано"):
+        if self.status_label.text().startswith("Скопировано"):
             if self._worker is not None:
                 self.status_label.setText("Сканирование продолжается…")
             else:
@@ -848,35 +848,35 @@ class ScanTab(QWidget):
         menu = QMenu(self)
         if host.ip:
             menu.addAction(
-                f"📋 Копировать IP — {host.ip}",
+                f"Копировать IP — {host.ip}",
                 lambda: self._copy_to_clipboard(host.ip, host.ip),
             )
         if host.hostname:
             menu.addAction(
-                f"📋 Копировать имя хоста — {host.hostname}",
+                f"Копировать имя хоста — {host.hostname}",
                 lambda: self._copy_to_clipboard(host.hostname, host.hostname),
             )
         if host.mac:
             mac_up = host.mac.upper()
             menu.addAction(
-                f"📋 Копировать MAC — {mac_up}",
+                f"Копировать MAC — {mac_up}",
                 lambda: self._copy_to_clipboard(mac_up, mac_up),
             )
         if host.vendor:
             menu.addAction(
-                "📋 Копировать производителя",
+                "Копировать производителя",
                 lambda: self._copy_to_clipboard(host.vendor, host.vendor),
             )
         if host.open_ports:
             ports_str = ", ".join(str(p) for p in host.open_ports)
             menu.addAction(
-                "📋 Копировать список портов",
+                "Копировать список портов",
                 lambda: self._copy_to_clipboard(ports_str, "список портов"),
             )
         if menu.actions():
             menu.addSeparator()
         menu.addAction(
-            "📋 Копировать строку (TSV)",
+            "Копировать строку (TSV)",
             lambda: self._copy_row(host),
         )
         return menu
@@ -1188,7 +1188,7 @@ class WifiTab(QWidget):
         disconnected_page = QWidget()
         disconnected_layout = QVBoxLayout(disconnected_page)
         disconnected_layout.setContentsMargins(0, 16, 0, 16)
-        self.lbl_disconnected = QLabel("📡 Wi-Fi не подключен")
+        self.lbl_disconnected = QLabel("Wi-Fi не подключен")
         self.lbl_disconnected.setAlignment(Qt.AlignCenter)
         self.lbl_disconnected.setStyleSheet(
             "color: #f9e2af; font-size: 18px; font-weight: bold; padding: 20px;"
@@ -1315,10 +1315,10 @@ class WifiTab(QWidget):
             self.wifi_stack.setCurrentIndex(1)
             if not info:
                 self.lbl_disconnected.setText(
-                    "📡 Wi-Fi не подключен\n(беспроводной адаптер не обнаружен)"
+                    "Wi-Fi не подключен\n(беспроводной адаптер не обнаружен)"
                 )
             else:
-                self.lbl_disconnected.setText("📡 Wi-Fi не подключен")
+                self.lbl_disconnected.setText("Wi-Fi не подключен")
 
         # Router info
         self.lbl_gw_ip.setText(gw or "—")
@@ -1385,7 +1385,7 @@ class MainWindow(QMainWindow):
             show_auto_detect=False,
             auto_start=False,
             warning_text=(
-                "⚠ Сканирование внешних сетей может нарушать правила провайдера и "
+                "Внимание: сканирование внешних сетей может нарушать правила провайдера и "
                 "действующее законодательство. Сканируйте только те ресурсы, "
                 "на которые у вас есть явное разрешение."
             ),
