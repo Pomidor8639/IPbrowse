@@ -48,7 +48,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
     QStyle,
     QTabWidget,
@@ -710,7 +712,8 @@ class WifiTab(QWidget):
 
     REFRESH_MS = 2000
 
-    refreshed = Signal(dict, str, str, str)  # info, gateway_ip, gateway_mac, gateway_vendor
+    # info, gateway_ip, gateway_mac, gateway_vendor, gateway_ping_ms (or None)
+    refreshed = Signal(dict, str, str, str, object)
 
     def __init__(
         self,
@@ -735,10 +738,17 @@ class WifiTab(QWidget):
 
         # ---- Wi-Fi connection info ----
         wifi_box = QGroupBox("Текущее Wi-Fi подключение")
-        wifi_form = QFormLayout(wifi_box)
+        wifi_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        wifi_box_layout = QVBoxLayout(wifi_box)
+        wifi_box_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.wifi_stack = QStackedWidget()
+        # Page 0 — connected: form with all fields.
+        connected_page = QWidget()
+        wifi_form = QFormLayout(connected_page)
         wifi_form.setLabelAlignment(Qt.AlignRight)
+        wifi_form.setContentsMargins(0, 0, 0, 0)
         self.lbl_iface = QLabel("—")
-        self.lbl_state = QLabel("—")
         self.lbl_ssid = QLabel("—")
         self.lbl_bssid = QLabel("—")
         self.lbl_signal = QLabel("—")
@@ -749,7 +759,6 @@ class WifiTab(QWidget):
         for lbl in (self.lbl_ssid, self.lbl_bssid):
             lbl.setFont(mono)
         wifi_form.addRow("Интерфейс:", self.lbl_iface)
-        wifi_form.addRow("Состояние:", self.lbl_state)
         wifi_form.addRow("SSID:", self.lbl_ssid)
         wifi_form.addRow("BSSID:", self.lbl_bssid)
         wifi_form.addRow("Сигнал:", self.lbl_signal)
@@ -757,10 +766,26 @@ class WifiTab(QWidget):
         wifi_form.addRow("Тип радио:", self.lbl_radio)
         wifi_form.addRow("Безопасность:", self.lbl_auth)
         wifi_form.addRow("Скорость канала:", self.lbl_speed)
+
+        # Page 1 — disconnected: a single centred message.
+        disconnected_page = QWidget()
+        disconnected_layout = QVBoxLayout(disconnected_page)
+        disconnected_layout.setContentsMargins(0, 16, 0, 16)
+        self.lbl_disconnected = QLabel("📡 Wi-Fi не подключен")
+        self.lbl_disconnected.setAlignment(Qt.AlignCenter)
+        self.lbl_disconnected.setStyleSheet(
+            "color: #f9e2af; font-size: 18px; font-weight: bold; padding: 20px;"
+        )
+        disconnected_layout.addWidget(self.lbl_disconnected)
+
+        self.wifi_stack.addWidget(connected_page)     # index 0
+        self.wifi_stack.addWidget(disconnected_page)  # index 1
+        wifi_box_layout.addWidget(self.wifi_stack)
         root.addWidget(wifi_box)
 
         # ---- Router info ----
         router_box = QGroupBox("Роутер")
+        router_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         router_form = QFormLayout(router_box)
         router_form.setLabelAlignment(Qt.AlignRight)
         self.lbl_gw_ip = QLabel("—")
@@ -781,10 +806,15 @@ class WifiTab(QWidget):
 
         # ---- Graphs ----
         graphs_box = QGroupBox("Графики (обновление каждые 2 с)")
+        graphs_box.setMinimumHeight(190)
+        graphs_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         graphs_layout = QHBoxLayout(graphs_box)
+        # Ping-to-router graph works on every connection (wired or Wi-Fi).
+        self.ping_graph = SparklineWidget(title="Пинг до роутера", unit="мс", color="#cba6f7")
         self.signal_graph = SparklineWidget(title="Сигнал", unit="%", color="#a6e3a1")
         self.rx_graph = SparklineWidget(title="Приём", unit="Мбит/с", color="#89b4fa")
         self.tx_graph = SparklineWidget(title="Передача", unit="Мбит/с", color="#fab387")
+        graphs_layout.addWidget(self.ping_graph, 1)
         graphs_layout.addWidget(self.signal_graph, 1)
         graphs_layout.addWidget(self.rx_graph, 1)
         graphs_layout.addWidget(self.tx_graph, 1)
@@ -807,19 +837,22 @@ class WifiTab(QWidget):
             gw = ""
         mac = ""
         vendor = ""
+        rtt: float | None = None
         if gw:
             try:
-                ping(gw, timeout_ms=500)
+                alive, rtt_value = ping(gw, timeout_ms=500)
+                if alive and rtt_value is not None:
+                    rtt = rtt_value
                 arp = _parse_arp_table()
                 mac = arp.get(gw, "")
                 if mac:
                     vendor = lookup_vendor(mac)
             except Exception:  # noqa: BLE001
                 pass
-        self.refreshed.emit(info, gw, mac, vendor)
+        self.refreshed.emit(info, gw, mac, vendor, rtt)
 
     def _apply_refresh(
-        self, info: dict, gw: str, mac: str, vendor: str,
+        self, info: dict, gw: str, mac: str, vendor: str, rtt,
     ) -> None:
         def pick(*keys: str) -> str:
             for k in keys:
@@ -842,16 +875,13 @@ class WifiTab(QWidget):
         )
         tx = pick("Transmit rate (Mbps)", "Скорость передачи (Мбит/с)")
 
-        if not info:
-            self.lbl_iface.setText("Беспроводной интерфейс не обнаружен")
-            self.lbl_state.setText("—")
-            connected = False
-        else:
-            self.lbl_iface.setText(name or "—")
-            self.lbl_state.setText(state or "—")
-            connected = bool(ssid) or state.lower().startswith(("connected", "подкл"))
+        connected = bool(ssid) or (
+            bool(info) and state.lower().startswith(("connected", "подкл"))
+        )
 
         if connected:
+            self.wifi_stack.setCurrentIndex(0)
+            self.lbl_iface.setText(name or "—")
             self.lbl_ssid.setText(ssid or "—")
             self.lbl_bssid.setText(bssid.upper() if bssid else "—")
             self.lbl_signal.setText(signal or "—")
@@ -865,12 +895,13 @@ class WifiTab(QWidget):
                 speed_parts.append(f"TX {tx} Мбит/с")
             self.lbl_speed.setText(" · ".join(speed_parts) if speed_parts else "—")
         else:
-            placeholder = "—"
-            for lbl in (
-                self.lbl_ssid, self.lbl_bssid, self.lbl_signal,
-                self.lbl_channel, self.lbl_radio, self.lbl_auth, self.lbl_speed,
-            ):
-                lbl.setText(placeholder)
+            self.wifi_stack.setCurrentIndex(1)
+            if not info:
+                self.lbl_disconnected.setText(
+                    "📡 Wi-Fi не подключен\n(беспроводной адаптер не обнаружен)"
+                )
+            else:
+                self.lbl_disconnected.setText("📡 Wi-Fi не подключен")
 
         # Router info
         self.lbl_gw_ip.setText(gw or "—")
@@ -885,24 +916,28 @@ class WifiTab(QWidget):
         else:
             self.lbl_clients.setText("—")
 
-        # Update graphs.
-        if signal:
-            try:
-                digits = re.sub(r"[^\d]", "", signal)
-                if digits:
-                    self.signal_graph.add_value(int(digits))
-            except ValueError:
-                pass
-        if rx:
-            try:
-                self.rx_graph.add_value(float(rx))
-            except ValueError:
-                pass
-        if tx:
-            try:
-                self.tx_graph.add_value(float(tx))
-            except ValueError:
-                pass
+        # Update graphs. Ping graph works on any link (wired or wireless);
+        # the Wi-Fi graphs only get fed while a Wi-Fi connection is active.
+        if rtt is not None:
+            self.ping_graph.add_value(rtt)
+        if connected:
+            if signal:
+                try:
+                    digits = re.sub(r"[^\d]", "", signal)
+                    if digits:
+                        self.signal_graph.add_value(int(digits))
+                except ValueError:
+                    pass
+            if rx:
+                try:
+                    self.rx_graph.add_value(float(rx))
+                except ValueError:
+                    pass
+            if tx:
+                try:
+                    self.tx_graph.add_value(float(tx))
+                except ValueError:
+                    pass
 
     def _open_admin(self) -> None:
         ip = self.lbl_gw_ip.text().strip()
