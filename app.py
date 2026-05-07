@@ -486,14 +486,37 @@ class ScanWorker(QObject):
     def run(self) -> None:
         try:
             total = len(self.targets)
-            done = 0
-            self.progress.emit(0, total)
+            # Per-IP progress weight in [0.0, 1.0]. Summing gives the number
+            # of IPs effectively scanned so far — this lets the progress bar
+            # advance smoothly *during* phase 2 port scans instead of
+            # freezing on the count of dead hosts until every port sweep
+            # finishes. Milestones:
+            #   0.1 — alive detected in phase 1 (ping reply)
+            #   0.2 — hostname / MAC resolved (start of phase 2)
+            #   0.2 + 0.8 * ports_done / ports_total — port sweep progress
+            #   1.0 — host fully scanned (dead in phase 1 or phase 2 done)
+            weights: dict[str, float] = {ip: 0.0 for ip in self.targets}
+
+            def _emit_progress() -> None:
+                done = int(sum(weights.values()))
+                self.progress.emit(done, total)
+
+            _emit_progress()
 
             def _on_partial(host: Host) -> None:
+                if host.ip in weights:
+                    weights[host.ip] = max(weights[host.ip], 0.2)
                 self.host_found.emit(host)
+                _emit_progress()
 
             def _on_port_progress(ip: str, d: int, t: int) -> None:
+                # Keep the assignment monotonic — callbacks for different
+                # ports of the same host can race against the final
+                # phase-2 yield that already bumped this IP's weight to 1.0.
+                if ip in weights and t > 0:
+                    weights[ip] = max(weights[ip], 0.2 + 0.8 * (d / t))
                 self.port_progress.emit(ip, d, t)
+                _emit_progress()
 
             for host in scan_network(
                 self.targets,
@@ -511,9 +534,14 @@ class ScanWorker(QObject):
                 ping_retries=self.ping_retries,
             ):
                 self.host_found.emit(host)
-                if host.scan_complete:
-                    done += 1
-                    self.progress.emit(done, total)
+                if host.ip in weights:
+                    if host.scan_complete:
+                        weights[host.ip] = 1.0
+                    elif host.alive:
+                        # Phase 1 alive detection — keep the value monotonic
+                        # in case _on_partial has already bumped it to 0.2.
+                        weights[host.ip] = max(weights[host.ip], 0.1)
+                _emit_progress()
                 if self._cancel.is_set():
                     break
         except Exception as exc:  # noqa: BLE001
