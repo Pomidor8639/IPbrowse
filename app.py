@@ -631,7 +631,10 @@ class ScanTab(QWidget):
 
         self._build_ui(default_target, show_auto_detect, warning_text)
         if auto_start:
-            QTimer.singleShot(0, self.start_scan)
+            # Defer the scan a bit so the window has time to paint and the
+            # initial process-spawn storm (one ping per IP) doesn't make
+            # the UI feel laggy on startup.
+            QTimer.singleShot(800, self.start_scan)
 
     # ---------- UI ----------
     def _build_ui(self, default_target: str, show_auto_detect: bool, warning_text: str) -> None:
@@ -1139,7 +1142,9 @@ class WifiTab(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
         self._timer.start(self.REFRESH_MS)
-        QTimer.singleShot(0, self._refresh)
+        # Defer the first refresh a bit so we don't pile up against the
+        # local scan tab also starting on launch.
+        QTimer.singleShot(300, self._refresh)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -1458,6 +1463,24 @@ class MainWindow(QMainWindow):
             }
             QTabBar::tab:hover:!selected { background: #45475a; }
             QToolTip { background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
+
+            QMenu {
+                background: #181825; color: #cdd6f4;
+                border: 1px solid #45475a; border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 22px 6px 14px; border-radius: 4px;
+                margin: 1px 2px;
+                background: transparent; color: #cdd6f4;
+            }
+            QMenu::item:selected, QMenu::item:hover {
+                background: #585b70; color: #ffffff;
+            }
+            QMenu::item:disabled { color: #6c7086; }
+            QMenu::separator {
+                height: 1px; background: #45475a; margin: 4px 8px;
+            }
             """
         )
 
