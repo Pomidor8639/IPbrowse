@@ -91,6 +91,9 @@ class Host:
     vendor: str = ""
     open_ports: list[int] = field(default_factory=list)
     response_ms: float | None = None
+    ttl: int | None = None                              # raw TTL from ping reply
+    os_guess: str = ""                                  # -O: family from TTL
+    banners: dict[int, str] = field(default_factory=dict)  # -sV: per-port banner
     port_scan_done: int = 0
     port_scan_total: int = 0
     scan_complete: bool = False
@@ -98,6 +101,11 @@ class Host:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["open_ports"] = ",".join(str(p) for p in self.open_ports)
+        # Banners are kept as a dict for JSON; flatten to "port=banner;..."
+        # for CSV-friendly export. JSON callers can re-parse.
+        d["banners"] = ";".join(
+            f"{p}={b}" for p, b in sorted(self.banners.items())
+        )
         for k in ("port_scan_done", "port_scan_total", "scan_complete"):
             d.pop(k, None)
         return d
@@ -141,8 +149,15 @@ def expand_target(target: str) -> list[str]:
     return unique
 
 
-def ping(ip: str, timeout_ms: int = 700) -> tuple[bool, float | None]:
-    """Send a single ICMP echo request. Returns (alive, response_ms)."""
+def ping(
+    ip: str, timeout_ms: int = 700
+) -> tuple[bool, float | None, int | None]:
+    """Send a single ICMP echo request.
+
+    Returns ``(alive, response_ms, ttl)``. ``ttl`` is the value reported
+    in the reply line ("TTL=64" / "ttl=64") and is used by ``guess_os_from_ttl``
+    when ``-O`` is enabled.
+    """
     if IS_WINDOWS:
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
     else:
@@ -150,20 +165,141 @@ def ping(ip: str, timeout_ms: int = 700) -> tuple[bool, float | None]:
 
     rc, out = _run(cmd, timeout=(timeout_ms / 1000) + 1.5)
     if rc != 0:
-        return False, None
+        return False, None, None
 
     # On Windows `ping` may return 0 even when the host is unreachable
     # (e.g. "Destination host unreachable" message). A real reply always
     # contains "TTL=" — both English and localized output keep this token.
     if IS_WINDOWS and "TTL=" not in out.upper().replace(" ", ""):
-        return False, None
+        return False, None, None
 
     # Parse response time. Handles English ("time=12ms", "time<1ms") and
     # localized ("время=12мс", "время<1мс") output by looking for an
     # equals/less sign followed by a number followed by "ms"/"мс".
     match = re.search(r"[=<]\s*([\d.]+)\s*(?:ms|мс)", out, re.IGNORECASE)
     rtt = float(match.group(1)) if match else None
-    return True, rtt
+
+    # TTL is reported as "TTL=64" on Windows (English / Russian) and
+    # "ttl=64" on Linux/macOS. Tolerate either case + optional whitespace.
+    ttl_match = re.search(r"TTL\s*=\s*(\d+)", out, re.IGNORECASE)
+    ttl = int(ttl_match.group(1)) if ttl_match else None
+    return True, rtt, ttl
+
+
+def guess_os_from_ttl(ttl: int | None) -> str:
+    """Crude OS family guess from a single TTL value.
+
+    Routers / OSes pick a starting TTL (typically 64, 128 or 255) and
+    decrement it by one per hop. On a local LAN scan (1 hop) the value
+    seen in the reply is essentially the start value, which gives a
+    reliable family hint:
+
+        TTL <= 64   → Linux / macOS / *BSD
+        TTL <= 128  → Windows
+        TTL <= 255  → Network device (Cisco IOS, routers, printers, ...)
+
+    For multi-hop / Internet scans this is much less reliable and only
+    indicates the *family* of the OS that produced the reply.
+    """
+    if not ttl or ttl <= 0:
+        return ""
+    if ttl <= 64:
+        return "Linux/macOS"
+    if ttl <= 128:
+        return "Windows"
+    return "Сетевое устройство"
+
+
+# Ports for which a service typically sends a banner immediately on
+# connect (no client probe needed). Used by ``grab_banner`` for the
+# ``-sV`` flag.
+_BANNER_FIRST_PORTS: frozenset[int] = frozenset({
+    21, 22, 23, 25, 110, 143, 220, 465, 587, 993, 995, 5900, 6667,
+})
+
+
+def grab_banner(ip: str, port: int, timeout: float = 1.5) -> str:
+    """Return a one-line service banner for ``ip:port``, or "".
+
+    The function is best-effort and never raises. It tries two probes:
+
+    1. Wait briefly for an immediately-pushed banner (works for SSH,
+       FTP, SMTP, IMAP, POP3, IRC, VNC and a few more — see
+       ``_BANNER_FIRST_PORTS``).
+    2. Fall back to a minimal HTTP ``HEAD`` request for everything else;
+       this picks up the ``Server:`` header from web servers / HTTP-like
+       services running on arbitrary ports.
+
+    The first non-empty line of the response is returned, with control
+    characters stripped and length capped at 120 chars so the banner
+    fits inline in the GUI.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            try:
+                sock.connect((ip, port))
+            except OSError:
+                return ""
+
+            data: bytes = b""
+            if port in _BANNER_FIRST_PORTS:
+                try:
+                    sock.settimeout(timeout)
+                    data = sock.recv(2048)
+                except (socket.timeout, OSError):
+                    data = b""
+
+            if not data:
+                # Generic HTTP-style probe; harmless against most other
+                # text-protocol services because they just close.
+                try:
+                    sock.sendall(
+                        b"HEAD / HTTP/1.0\r\n"
+                        b"Host: " + ip.encode("ascii", "replace") + b"\r\n"
+                        b"User-Agent: IPbrowse\r\n\r\n"
+                    )
+                    sock.settimeout(timeout)
+                    chunks: list[bytes] = []
+                    deadline_left = timeout
+                    while deadline_left > 0:
+                        try:
+                            chunk = sock.recv(2048)
+                        except (socket.timeout, OSError):
+                            break
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if sum(len(c) for c in chunks) >= 4096:
+                            break
+                    data = b"".join(chunks)
+                except OSError:
+                    return ""
+    except OSError:
+        return ""
+
+    if not data:
+        return ""
+
+    text = data.decode("utf-8", errors="replace")
+
+    # Prefer "Server:" header for HTTP responses.
+    server_match = re.search(
+        r"^Server:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE
+    )
+    if server_match:
+        line = server_match.group(1)
+    else:
+        line = next(
+            (ln for ln in text.splitlines() if ln.strip()),
+            "",
+        )
+
+    # Strip control chars and clamp.
+    line = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", line).strip()
+    if len(line) > 120:
+        line = line[:117] + "..."
+    return line
 
 
 def resolve_hostname(ip: str) -> str:
@@ -286,6 +422,9 @@ def scan_network(
     port_progress_cb: Callable[[str, int, int], None] | None = None,
     skip_ping: bool = False,
     ping_retries: int = 1,
+    arp_discovery: bool = False,
+    os_detect: bool = False,
+    version_detect: bool = False,
 ) -> Iterator[Host]:
     """Yield Host objects as they are discovered.
 
@@ -297,6 +436,14 @@ def scan_network(
     is delivered through ``on_host_update`` and per-port progress through
     ``port_progress_cb`` (``ip``, ``done``, ``total``). The fully-scanned
     Host with ``scan_complete=True`` is then yielded by the iterator.
+
+    Optional flags:
+      ``arp_discovery``   (-PR) — also mark hosts visible in the system
+                                  ARP cache as alive (catches ICMP-blocking
+                                  devices that still answer ARP).
+      ``os_detect``       (-O)  — set ``host.os_guess`` from the ping TTL.
+      ``version_detect``  (-sV) — best-effort banner grab on every open
+                                  port, stored in ``host.banners``.
     """
     ports = list(ports or [])
     total_ports = len(ports)
@@ -313,40 +460,72 @@ def scan_network(
                 scan_complete=False,
             )
         attempts = max(1, ping_retries)
+        last_ttl: int | None = None
         for _ in range(attempts):
-            alive, rtt = ping(ip, timeout_ms=ping_timeout_ms)
+            alive, rtt, ttl = ping(ip, timeout_ms=ping_timeout_ms)
             if alive:
                 return Host(
                     ip=ip,
                     alive=True,
                     response_ms=rtt,
+                    ttl=ttl,
+                    os_guess=guess_os_from_ttl(ttl) if os_detect else "",
                     port_scan_total=total_ports,
                     scan_complete=False,
                 )
+            last_ttl = ttl  # almost always None, kept for completeness
         return Host(
             ip=ip,
             alive=False,
             response_ms=None,
+            ttl=last_ttl,
             port_scan_total=total_ports,
             scan_complete=True,
         )
 
     alive_hosts: list[Host] = []
+    dead_hosts: list[Host] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_check, ip): ip for ip in targets}
         for fut in as_completed(futures):
             if cancel_event is not None and cancel_event.is_set():
                 break
             host = fut.result()
-            yield host
             if host.alive:
+                yield host
                 alive_hosts.append(host)
+            else:
+                # With -PR we may resurrect dead hosts below, so defer
+                # yielding them until after the ARP cache check. Without
+                # -PR they are yielded immediately to keep the historical
+                # phase-1 streaming behaviour intact.
+                if arp_discovery:
+                    dead_hosts.append(host)
+                else:
+                    yield host
 
     if cancel_event is not None and cancel_event.is_set():
         return
 
-    # Refresh ARP cache after the sweep so it's populated.
-    arp_cache = _parse_arp_table() if detect_mac else {}
+    # -PR: re-check the ICMP-dead hosts against the system ARP cache.
+    # An entry there means a device with that IP recently answered ARP
+    # on this LAN, even if it silently drops ICMP echo requests.
+    arp_cache: dict[str, str] = {}
+    if arp_discovery or detect_mac:
+        arp_cache = _parse_arp_table()
+    if arp_discovery:
+        for host in dead_hosts:
+            if host.ip in arp_cache:
+                host.alive = True
+                host.scan_complete = False
+                host.port_scan_total = total_ports
+                host.mac = arp_cache[host.ip]
+                if host.mac and detect_mac:
+                    host.vendor = lookup_vendor(host.mac)
+                yield host
+                alive_hosts.append(host)
+            else:
+                yield host
 
     # Phase 2: enrich alive hosts (hostname, MAC, vendor, ports)
     def _enrich(host: Host) -> Host:
@@ -356,13 +535,16 @@ def scan_network(
         if resolve_hostnames:
             host.hostname = resolve_hostname(host.ip)
         if detect_mac:
-            host.mac = get_mac(host.ip, arp_cache)
-            if host.mac:
+            # Don't clobber a MAC already set by the ARP-discovery step.
+            if not host.mac:
+                host.mac = get_mac(host.ip, arp_cache)
+            if host.mac and not host.vendor:
                 host.vendor = lookup_vendor(host.mac)
         if on_host_update:
             on_host_update(Host(
                 ip=host.ip, alive=host.alive, hostname=host.hostname,
                 mac=host.mac, vendor=host.vendor, response_ms=host.response_ms,
+                ttl=host.ttl, os_guess=host.os_guess,
                 port_scan_done=0, port_scan_total=total_ports,
                 scan_complete=False,
             ))
@@ -378,6 +560,20 @@ def scan_network(
                 workers=port_workers,
                 progress_cb=_cb,
             )
+            # -sV: per-port banner grab on whatever came back open.
+            if version_detect and host.open_ports and not (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                bw = min(port_workers, max(1, len(host.open_ports)))
+                with ThreadPoolExecutor(max_workers=bw) as bpool:
+                    bfutures = {
+                        bpool.submit(grab_banner, host.ip, p, port_timeout * 2): p
+                        for p in host.open_ports
+                    }
+                    for bf in as_completed(bfutures):
+                        banner = bf.result()
+                        if banner:
+                            host.banners[bfutures[bf]] = banner
         host.port_scan_done = total_ports
         host.port_scan_total = total_ports
         host.scan_complete = True

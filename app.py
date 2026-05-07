@@ -113,23 +113,33 @@ TIMING_TEMPLATES: dict[int, tuple[str, str, int, int]] = {
 class ScanFlags:
     """Optional scan flags configurable per tab via the FlagsDialog."""
 
+    # Scan method (informational — this scanner is TCP-connect only)
+    tcp_connect: bool = False               # -sT (default behaviour, explicit)
     # Host discovery
     skip_ping: bool = False                 # -Pn
+    arp_discovery: bool = False             # -PR (ARP cache supplement)
     retries: int = 1                        # --retry N; 1 = no extra retries
     randomize_hosts: bool = False           # --randomize-hosts
     # Resolution / identification
     no_dns: bool = False                    # -n / --no-dns
     no_mac: bool = False                    # --no-mac
+    os_detect: bool = False                 # -O (TTL-based OS guess)
+    version_detect: bool = False            # -sV (banner grabbing)
     # Timing
     timing: int = 3                         # -T<N>; 3 = no override
     host_timeout_ms: int = 0                # --host-timeout <ms>; 0 = auto
     # Ports
     no_ports: bool = False                  # -sn (skip port scan, ping only)
+    fast_scan: bool = False                 # -F (top-100 alias)
+    all_ports: bool = False                 # -p- (all ports, 1-65535)
     top_ports: int = 0                      # --top-ports N; 0 = disabled
     randomize_ports: bool = False           # --randomize-ports
     max_parallel: int = 0                   # --max-parallel N; 0 = auto
     # Exclusions
     exclude_text: str = ""                  # --exclude IPs / ranges
+    # Output (auto-export when scan finishes if path is set)
+    output_format: str = ""                 # "" / "normal" / "xml" / "grepable"
+    output_path: str = ""                   # -oN / -oX / -oG <file>; "" = disabled
 
     def is_default(self) -> bool:
         return self == ScanFlags()
@@ -137,12 +147,20 @@ class ScanFlags:
     def to_summary(self) -> str:
         """Human-readable summary like ``-Pn -T4 --top-ports 100``."""
         parts: list[str] = []
+        if self.tcp_connect:
+            parts.append("-sT")
         if self.skip_ping:
             parts.append("-Pn")
+        if self.arp_discovery:
+            parts.append("-PR")
         if self.no_dns:
             parts.append("-n")
         if self.no_mac:
             parts.append("--no-mac")
+        if self.os_detect:
+            parts.append("-O")
+        if self.version_detect:
+            parts.append("-sV")
         if self.no_ports:
             parts.append("-sn")
         if self.timing != 3:
@@ -151,6 +169,10 @@ class ScanFlags:
             parts.append(f"--host-timeout {self.host_timeout_ms}ms")
         if self.max_parallel > 0:
             parts.append(f"--max-parallel {self.max_parallel}")
+        if self.fast_scan:
+            parts.append("-F")
+        if self.all_ports:
+            parts.append("-p-")
         if self.top_ports:
             parts.append(f"--top-ports {self.top_ports}")
         if self.randomize_ports:
@@ -161,6 +183,14 @@ class ScanFlags:
             parts.append(f"--retry {self.retries}")
         if self.exclude_text.strip():
             parts.append(f"--exclude {self.exclude_text.strip()}")
+        if self.output_format and self.output_path:
+            switch = {
+                "normal": "-oN",
+                "xml": "-oX",
+                "grepable": "-oG",
+            }.get(self.output_format, "")
+            if switch:
+                parts.append(f"{switch} {self.output_path}")
         return " ".join(parts)
 
 
@@ -200,6 +230,43 @@ class FlagsDialog(QDialog):
         info.setStyleSheet("color: #94e2d5; font-style: italic;")
         root.addWidget(info)
 
+        # The dialog is now tall enough that it can overflow on small
+        # screens; wrap everything in a scroll area so every flag stays
+        # reachable regardless of resolution.
+        from PySide6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll_inner = QWidget()
+        body = QVBoxLayout(scroll_inner)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(10)
+
+        # ---- Scan method ----
+        method_box = QGroupBox("Метод сканирования")
+        method_layout = QVBoxLayout(method_box)
+        method_layout.setSpacing(6)
+
+        self.cb_tcp_connect = QCheckBox()
+        sct_row = QHBoxLayout()
+        sct_row.addWidget(self.cb_tcp_connect)
+        sct_row.addWidget(self._flag_label("-sT"))
+        sct_row.addWidget(QLabel(
+            "TCP Connect — единственный режим (полный TCP-handshake; помечается явно)"
+        ), 1)
+        method_layout.addLayout(sct_row)
+
+        unsup = QLabel(
+            "Недоступно без nmap / прав администратора:  -sS (SYN), "
+            "-sU (UDP), -sO (IP protocol), -A (Aggressive), "
+            "-sC / --script (NSE), -D (decoy), -f (fragmentation)."
+        )
+        unsup.setWordWrap(True)
+        unsup.setStyleSheet("color: #f9e2af; font-style: italic;")
+        method_layout.addWidget(unsup)
+
+        body.addWidget(method_box)
+
         # ---- Host discovery ----
         host_box = QGroupBox("Обнаружение хостов")
         host_layout = QVBoxLayout(host_box)
@@ -213,6 +280,16 @@ class FlagsDialog(QDialog):
             "Пропустить ping (сканировать все адреса как активные)"
         ), 1)
         host_layout.addLayout(skip_row)
+
+        self.cb_arp_discovery = QCheckBox()
+        pr_row = QHBoxLayout()
+        pr_row.addWidget(self.cb_arp_discovery)
+        pr_row.addWidget(self._flag_label("-PR"))
+        pr_row.addWidget(QLabel(
+            "Дополнительно проверять активность по ARP-кэшу "
+            "(находит устройства, блокирующие ICMP)"
+        ), 1)
+        host_layout.addLayout(pr_row)
 
         self.cb_retries = QCheckBox()
         retry_row = QHBoxLayout()
@@ -235,7 +312,7 @@ class FlagsDialog(QDialog):
         ), 1)
         host_layout.addLayout(rh_row)
 
-        root.addWidget(host_box)
+        body.addWidget(host_box)
 
         # ---- Resolution / identification ----
         resolve_box = QGroupBox("Резолв и идентификация")
@@ -260,7 +337,25 @@ class FlagsDialog(QDialog):
         ), 1)
         resolve_layout.addLayout(nm_row)
 
-        root.addWidget(resolve_box)
+        self.cb_os_detect = QCheckBox()
+        os_row = QHBoxLayout()
+        os_row.addWidget(self.cb_os_detect)
+        os_row.addWidget(self._flag_label("-O"))
+        os_row.addWidget(QLabel(
+            "Определять семейство ОС по TTL ответа ping (Linux/Windows/сетевое)"
+        ), 1)
+        resolve_layout.addLayout(os_row)
+
+        self.cb_version_detect = QCheckBox()
+        sv_row = QHBoxLayout()
+        sv_row.addWidget(self.cb_version_detect)
+        sv_row.addWidget(self._flag_label("-sV"))
+        sv_row.addWidget(QLabel(
+            "Снимать баннеры с открытых портов (SSH / HTTP / FTP / SMTP / …)"
+        ), 1)
+        resolve_layout.addLayout(sv_row)
+
+        body.addWidget(resolve_box)
 
         # ---- Timing ----
         timing_box = QGroupBox("Тайминг")
@@ -291,7 +386,7 @@ class FlagsDialog(QDialog):
         ht_row.addStretch(1)
         timing_layout.addLayout(ht_row)
 
-        root.addWidget(timing_box)
+        body.addWidget(timing_box)
 
         # ---- Ports ----
         ports_box = QGroupBox("Порты")
@@ -306,6 +401,25 @@ class FlagsDialog(QDialog):
             "Только обнаружение хостов, без сканирования портов"
         ), 1)
         ports_layout.addLayout(sn_row)
+
+        self.cb_fast_scan = QCheckBox()
+        f_row = QHBoxLayout()
+        f_row.addWidget(self.cb_fast_scan)
+        f_row.addWidget(self._flag_label("-F"))
+        f_row.addWidget(QLabel(
+            "Fast scan — только 100 самых популярных портов "
+            "(алиас --top-ports 100)"
+        ), 1)
+        ports_layout.addLayout(f_row)
+
+        self.cb_all_ports = QCheckBox()
+        ap_row = QHBoxLayout()
+        ap_row.addWidget(self.cb_all_ports)
+        ap_row.addWidget(self._flag_label("-p-"))
+        ap_row.addWidget(QLabel(
+            "Сканировать все 65 535 портов (алиас 1-65535)"
+        ), 1)
+        ports_layout.addLayout(ap_row)
 
         self.cb_top_ports = QCheckBox()
         top_row = QHBoxLayout()
@@ -340,7 +454,7 @@ class FlagsDialog(QDialog):
         mp_row.addStretch(1)
         ports_layout.addLayout(mp_row)
 
-        root.addWidget(ports_box)
+        body.addWidget(ports_box)
 
         # ---- Exclusions ----
         excl_box = QGroupBox("Исключения")
@@ -357,9 +471,42 @@ class FlagsDialog(QDialog):
             "например, 192.168.1.1, 192.168.1.10-15, 10.0.0.0/24"
         )
         excl_layout.addWidget(self.le_exclude)
-        root.addWidget(excl_box)
+        body.addWidget(excl_box)
 
-        root.addStretch(1)
+        # ---- Output ----
+        out_box = QGroupBox("Вывод (автоматический экспорт по окончании)")
+        out_layout = QVBoxLayout(out_box)
+        out_layout.setSpacing(6)
+
+        self.cb_output = QCheckBox()
+        of_row = QHBoxLayout()
+        of_row.addWidget(self.cb_output)
+        of_row.addWidget(self._flag_label("-oN / -oX / -oG"))
+        of_row.addWidget(QLabel("Сохранять результат в файл:"))
+        self.cmb_output_format = QComboBox()
+        self.cmb_output_format.addItem("-oN  Текст (Normal)", "normal")
+        self.cmb_output_format.addItem("-oX  XML", "xml")
+        self.cmb_output_format.addItem("-oG  Grepable", "grepable")
+        of_row.addWidget(self.cmb_output_format)
+        of_row.addStretch(1)
+        out_layout.addLayout(of_row)
+
+        path_row = QHBoxLayout()
+        self.le_output_path = QLineEdit()
+        self.le_output_path.setPlaceholderText(
+            "путь к файлу (оставьте пустым — спросим при сохранении)"
+        )
+        path_row.addWidget(self.le_output_path, 1)
+        btn_browse = QPushButton("Обзор…")
+        btn_browse.clicked.connect(self._pick_output_path)
+        path_row.addWidget(btn_browse)
+        out_layout.addLayout(path_row)
+
+        body.addWidget(out_box)
+
+        body.addStretch(1)
+        scroll.setWidget(scroll_inner)
+        root.addWidget(scroll, 1)
 
         # ---- Buttons ----
         btn_row = QHBoxLayout()
@@ -377,10 +524,29 @@ class FlagsDialog(QDialog):
         btn_row.addWidget(btn_ok)
         root.addLayout(btn_row)
 
+    def _pick_output_path(self) -> None:
+        """Open a save dialog and write the chosen path into the line edit."""
+        fmt_data = self.cmb_output_format.currentData() or "normal"
+        ext, label = {
+            "normal":   ("txt",  "Text (*.txt)"),
+            "xml":      ("xml",  "XML (*.xml)"),
+            "grepable": ("gnmap", "Grepable (*.gnmap)"),
+        }[fmt_data]
+        default = f"scan_{datetime.now():%Y%m%d_%H%M%S}.{ext}"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Файл для автоэкспорта", default, label
+        )
+        if path:
+            self.le_output_path.setText(path)
+            self.cb_output.setChecked(True)
+
     # ----- Data binding -----
     def _apply_to_ui(self, f: ScanFlags) -> None:
+        # Method
+        self.cb_tcp_connect.setChecked(f.tcp_connect)
         # Host discovery
         self.cb_skip_ping.setChecked(f.skip_ping)
+        self.cb_arp_discovery.setChecked(f.arp_discovery)
         self.cb_retries.setChecked(f.retries > 1)
         if f.retries > 1:
             self.sp_retries.setValue(f.retries)
@@ -388,6 +554,8 @@ class FlagsDialog(QDialog):
         # Resolution
         self.cb_no_dns.setChecked(f.no_dns)
         self.cb_no_mac.setChecked(f.no_mac)
+        self.cb_os_detect.setChecked(f.os_detect)
+        self.cb_version_detect.setChecked(f.version_detect)
         # Timing
         idx = self.cmb_timing.findData(f.timing)
         self.cmb_timing.setCurrentIndex(idx if idx >= 0 else 3)
@@ -396,6 +564,8 @@ class FlagsDialog(QDialog):
             self.sp_host_timeout.setValue(f.host_timeout_ms)
         # Ports
         self.cb_no_ports.setChecked(f.no_ports)
+        self.cb_fast_scan.setChecked(f.fast_scan)
+        self.cb_all_ports.setChecked(f.all_ports)
         self.cb_top_ports.setChecked(f.top_ports > 0)
         if f.top_ports > 0:
             self.sp_top_ports.setValue(f.top_ports)
@@ -405,28 +575,46 @@ class FlagsDialog(QDialog):
             self.sp_max_parallel.setValue(f.max_parallel)
         # Exclusions
         self.le_exclude.setText(f.exclude_text)
+        # Output
+        self.cb_output.setChecked(bool(f.output_format and f.output_path))
+        if f.output_format:
+            i = self.cmb_output_format.findData(f.output_format)
+            if i >= 0:
+                self.cmb_output_format.setCurrentIndex(i)
+        self.le_output_path.setText(f.output_path)
 
     def _reset(self) -> None:
         self._apply_to_ui(ScanFlags())
 
     def get_flags(self) -> ScanFlags:
+        out_on = self.cb_output.isChecked() and bool(
+            self.le_output_path.text().strip()
+        )
         return ScanFlags(
+            tcp_connect=self.cb_tcp_connect.isChecked(),
             skip_ping=self.cb_skip_ping.isChecked(),
+            arp_discovery=self.cb_arp_discovery.isChecked(),
             retries=self.sp_retries.value() if self.cb_retries.isChecked() else 1,
             randomize_hosts=self.cb_randomize_hosts.isChecked(),
             no_dns=self.cb_no_dns.isChecked(),
             no_mac=self.cb_no_mac.isChecked(),
+            os_detect=self.cb_os_detect.isChecked(),
+            version_detect=self.cb_version_detect.isChecked(),
             timing=int(self.cmb_timing.currentData()),
             host_timeout_ms=(
                 self.sp_host_timeout.value() if self.cb_host_timeout.isChecked() else 0
             ),
             no_ports=self.cb_no_ports.isChecked(),
+            fast_scan=self.cb_fast_scan.isChecked(),
+            all_ports=self.cb_all_ports.isChecked(),
             top_ports=self.sp_top_ports.value() if self.cb_top_ports.isChecked() else 0,
             randomize_ports=self.cb_randomize.isChecked(),
             max_parallel=(
                 self.sp_max_parallel.value() if self.cb_max_parallel.isChecked() else 0
             ),
             exclude_text=self.le_exclude.text().strip(),
+            output_format=self.cmb_output_format.currentData() if out_on else "",
+            output_path=self.le_output_path.text().strip() if out_on else "",
         )
 
 
@@ -467,7 +655,11 @@ class HostsModel(QAbstractTableModel):
             if key == "mac":
                 return host.mac.upper() if host.mac else "—"
             if key == "vendor":
-                return host.vendor or "—"
+                # -O: OS guess from TTL is shown here next to the vendor.
+                # Either may be empty; combine with " • " when both exist.
+                if host.vendor and host.os_guess:
+                    return f"{host.vendor} • {host.os_guess}"
+                return host.vendor or host.os_guess or "—"
             if key == "response_ms":
                 return f"{host.response_ms:.1f}" if host.response_ms is not None else "—"
             if key == "open_ports":
@@ -484,7 +676,21 @@ class HostsModel(QAbstractTableModel):
                 parts = []
                 for p in host.open_ports:
                     name = COMMON_PORTS.get(p)
-                    parts.append(f"{p} ({name})" if name else str(p))
+                    banner = host.banners.get(p, "") if host.banners else ""
+                    if banner:
+                        # Trim the banner to keep the cell compact; the
+                        # full banner is available via the copy menu.
+                        short = banner[:40]
+                        if len(banner) > 40:
+                            short += "…"
+                        if name:
+                            parts.append(f"{p} ({name}: {short})")
+                        else:
+                            parts.append(f"{p} ({short})")
+                    elif name:
+                        parts.append(f"{p} ({name})")
+                    else:
+                        parts.append(str(p))
                 return ", ".join(parts)
         elif role == Qt.ForegroundRole:
             if not host.alive:
@@ -592,6 +798,9 @@ class ScanWorker(QObject):
         port_workers: int = 64,
         skip_ping: bool = False,
         ping_retries: int = 1,
+        arp_discovery: bool = False,
+        os_detect: bool = False,
+        version_detect: bool = False,
     ) -> None:
         super().__init__()
         self.targets = targets
@@ -604,6 +813,9 @@ class ScanWorker(QObject):
         self.port_workers = port_workers
         self.skip_ping = skip_ping
         self.ping_retries = ping_retries
+        self.arp_discovery = arp_discovery
+        self.os_detect = os_detect
+        self.version_detect = version_detect
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -658,6 +870,9 @@ class ScanWorker(QObject):
                 port_progress_cb=_on_port_progress,
                 skip_ping=self.skip_ping,
                 ping_retries=self.ping_retries,
+                arp_discovery=self.arp_discovery,
+                os_detect=self.os_detect,
+                version_detect=self.version_detect,
             ):
                 self.host_found.emit(host)
                 if host.ip in weights:
@@ -884,9 +1099,11 @@ class ScanTab(QWidget):
         self.btn_flags = QPushButton(" Флаги")
         self.btn_flags.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
         self.btn_flags.setToolTip(
-            "Дополнительные флаги сканирования: -Pn, -n, --no-mac, -sn, "
-            "-T<N>, --host-timeout, --top-ports, --randomize-hosts, "
-            "--randomize-ports, --max-parallel, --retry, --exclude"
+            "Дополнительные флаги сканирования:\n"
+            "-sT, -Pn, -PR, -n, --no-mac, -O, -sV, -sn, -F, -p-,\n"
+            "-T<N>, --host-timeout, --top-ports, --randomize-hosts,\n"
+            "--randomize-ports, --max-parallel, --retry, --exclude,\n"
+            "-oN / -oX / -oG (автоэкспорт)"
         )
         self.btn_flags.clicked.connect(self._open_flags_dialog)
 
@@ -1041,6 +1258,19 @@ class ScanTab(QWidget):
             menu.addAction(
                 "Копировать список портов",
                 lambda: self._copy_to_clipboard(ports_str, "список портов"),
+            )
+        if host.banners:
+            banners_text = "\n".join(
+                f"{p}: {b}" for p, b in sorted(host.banners.items())
+            )
+            menu.addAction(
+                "Копировать баннеры",
+                lambda: self._copy_to_clipboard(banners_text, "баннеры"),
+            )
+        if host.os_guess:
+            menu.addAction(
+                f"Копировать ОС — {host.os_guess}",
+                lambda: self._copy_to_clipboard(host.os_guess, host.os_guess),
             )
         if menu.actions():
             menu.addSeparator()
@@ -1224,13 +1454,21 @@ class ScanTab(QWidget):
         if f.randomize_hosts:
             random.shuffle(targets)
 
-        # Build the port list. -sn / --no-ports skips the port stage
-        # entirely; --top-ports overrides the manual ports field;
-        # --randomize-ports shuffles the resulting list.
+        # Build the port list. Priority of port-set flags is:
+        #   -sn / --no-ports : skip port stage entirely
+        #   -p-              : 1-65535 (overrides everything below)
+        #   -F               : top-100 (overrides --top-ports / manual)
+        #   --top-ports N    : top-N
+        #   <manual>         : whatever's in the ports field
+        # --randomize-ports then shuffles the final list.
         ports: list[int] = []
         do_ports = self.cb_ports.isChecked() and not f.no_ports
         if do_ports:
-            if f.top_ports > 0:
+            if f.all_ports:
+                ports = list(range(1, 65536))
+            elif f.fast_scan:
+                ports = list(TOP_PORTS[:100])
+            elif f.top_ports > 0:
                 ports = list(TOP_PORTS[:f.top_ports])
             else:
                 try:
@@ -1283,6 +1521,9 @@ class ScanTab(QWidget):
             port_workers=port_workers,
             skip_ping=f.skip_ping,
             ping_retries=f.retries,
+            arp_discovery=f.arp_discovery,
+            os_detect=f.os_detect,
+            version_detect=f.version_detect,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1323,12 +1564,183 @@ class ScanTab(QWidget):
         self._thread = None
         self._worker = None
 
+        # -oN / -oX / -oG: auto-export to the path the user picked in
+        # the Flags dialog. Failure is non-fatal — we just put the
+        # error in the status bar instead of popping a dialog over the
+        # finished scan.
+        f = self.flags
+        if f.output_format and f.output_path:
+            try:
+                hosts = self.model.alive_hosts()
+                self._write_results(Path(f.output_path), hosts, f.output_format)
+                self.status_label.setText(
+                    f"Сканирование завершено • активных: {alive} "
+                    f"• сохранено в {f.output_path}"
+                )
+            except OSError as exc:
+                self.status_label.setText(
+                    f"Сканирование завершено • не удалось сохранить: {exc}"
+                )
+
     def clear_results(self) -> None:
         self.model.clear()
         self.progress_bar.setValue(0)
         self.status_label.setText("Готов к сканированию")
 
     # ---------- Export ----------
+    _CSV_FIELDS = [
+        "ip", "alive", "hostname", "mac", "vendor",
+        "response_ms", "ttl", "os_guess", "open_ports", "banners",
+    ]
+
+    def _write_results(
+        self, path: Path, hosts: list[Host], fmt: str
+    ) -> None:
+        """Serialize ``hosts`` into ``path`` using the requested format.
+
+        Supported formats: ``csv`` / ``json`` (Export button) and the
+        nmap-style ``normal`` / ``xml`` / ``grepable`` (Flags dialog).
+        Raises ``OSError`` on filesystem failure; the writer functions
+        themselves never raise on host content.
+        """
+        fmt = fmt.lower()
+        if fmt == "json":
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(
+                    [h.to_dict() for h in hosts],
+                    fh, ensure_ascii=False, indent=2,
+                )
+        elif fmt == "xml":
+            self._write_xml(path, hosts)
+        elif fmt == "grepable":
+            self._write_grepable(path, hosts)
+        elif fmt == "normal":
+            self._write_normal(path, hosts)
+        else:  # csv
+            with path.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=self._CSV_FIELDS,
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+                for h in hosts:
+                    writer.writerow(h.to_dict())
+
+    @staticmethod
+    def _write_normal(path: Path, hosts: list[Host]) -> None:
+        """nmap-style ``-oN`` text output."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(f"# IPbrowse scan report — {ts}\n\n")
+            for h in hosts:
+                fh.write(f"Nmap scan report for {h.ip}\n")
+                fh.write(
+                    f"Host is {'up' if h.alive else 'down'}"
+                    + (f" ({h.response_ms:.1f} ms latency)" if h.response_ms is not None else "")
+                    + ".\n"
+                )
+                if h.hostname:
+                    fh.write(f"  Hostname: {h.hostname}\n")
+                if h.mac:
+                    vend = f" ({h.vendor})" if h.vendor else ""
+                    fh.write(f"  MAC Address: {h.mac.upper()}{vend}\n")
+                if h.os_guess:
+                    fh.write(f"  OS guess: {h.os_guess}")
+                    if h.ttl is not None:
+                        fh.write(f" (TTL={h.ttl})")
+                    fh.write("\n")
+                if h.open_ports:
+                    fh.write("  PORT     STATE  SERVICE         VERSION\n")
+                    for p in h.open_ports:
+                        svc = COMMON_PORTS.get(p, "")
+                        ban = h.banners.get(p, "") if h.banners else ""
+                        fh.write(
+                            f"  {p:<5}/tcp open   {svc:<15} {ban}\n"
+                        )
+                fh.write("\n")
+
+    @staticmethod
+    def _write_xml(path: Path, hosts: list[Host]) -> None:
+        """nmap-style ``-oX`` XML output (subset)."""
+        from xml.sax.saxutils import quoteattr
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+            fh.write(
+                f'<nmaprun scanner="ipbrowse" start={quoteattr(ts)} '
+                f'version="1.0" xmloutputversion="1.04">\n'
+            )
+            for h in hosts:
+                fh.write(
+                    f'  <host>\n'
+                    f'    <status state="{"up" if h.alive else "down"}"/>\n'
+                    f'    <address addr={quoteattr(h.ip)} addrtype="ipv4"/>\n'
+                )
+                if h.mac:
+                    fh.write(
+                        f'    <address addr={quoteattr(h.mac.upper())} '
+                        f'addrtype="mac" vendor={quoteattr(h.vendor or "")}/>\n'
+                    )
+                if h.hostname:
+                    fh.write(
+                        f'    <hostnames>\n'
+                        f'      <hostname name={quoteattr(h.hostname)} type="PTR"/>\n'
+                        f'    </hostnames>\n'
+                    )
+                if h.open_ports:
+                    fh.write('    <ports>\n')
+                    for p in h.open_ports:
+                        svc = COMMON_PORTS.get(p, "")
+                        ban = h.banners.get(p, "") if h.banners else ""
+                        fh.write(
+                            f'      <port protocol="tcp" portid="{p}">\n'
+                            f'        <state state="open"/>\n'
+                            f'        <service name={quoteattr(svc)}'
+                        )
+                        if ban:
+                            fh.write(f' product={quoteattr(ban)}')
+                        fh.write('/>\n')
+                        fh.write('      </port>\n')
+                    fh.write('    </ports>\n')
+                if h.os_guess:
+                    fh.write(
+                        f'    <os><osmatch name={quoteattr(h.os_guess)} '
+                        f'accuracy="50"/></os>\n'
+                    )
+                if h.response_ms is not None:
+                    fh.write(
+                        f'    <times srtt="{int(h.response_ms * 1000)}"/>\n'
+                    )
+                fh.write('  </host>\n')
+            fh.write('</nmaprun>\n')
+
+    @staticmethod
+    def _write_grepable(path: Path, hosts: list[Host]) -> None:
+        """nmap-style ``-oG`` grepable output, one host per line."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("w", encoding="utf-8") as fh:
+            fh.write(f"# IPbrowse {ts}\n")
+            for h in hosts:
+                hostname = f"({h.hostname})" if h.hostname else "()"
+                state = "Up" if h.alive else "Down"
+                fh.write(f"Host: {h.ip} {hostname}\tStatus: {state}\n")
+                if h.open_ports:
+                    parts = []
+                    for p in h.open_ports:
+                        svc = COMMON_PORTS.get(p, "")
+                        ban = h.banners.get(p, "") if h.banners else ""
+                        # Format: port/state/proto//service//version/
+                        parts.append(
+                            f"{p}/open/tcp//{svc}//{ban}/"
+                        )
+                    fh.write(
+                        f"Host: {h.ip} {hostname}\tPorts: " + ", ".join(parts)
+                        + "\n"
+                    )
+                if h.os_guess:
+                    fh.write(f"Host: {h.ip} {hostname}\tOS: {h.os_guess}\n")
+
     def export_results(self) -> None:
         hosts = self.model.alive_hosts() if not self.cb_show_dead.isChecked() else self.model.hosts()
         if not hosts:
@@ -1340,25 +1752,26 @@ class ScanTab(QWidget):
             self,
             "Экспорт результатов",
             default_name,
-            "CSV (*.csv);;JSON (*.json)",
+            "CSV (*.csv);;JSON (*.json);;Text (-oN) (*.txt);;XML (-oX) (*.xml);;Grepable (-oG) (*.gnmap)",
         )
         if not path_str:
             return
         path = Path(path_str)
 
+        # Pick the format from the dialog filter or the file extension.
+        fmt = "csv"
+        suffix = path.suffix.lower()
+        if "JSON" in selected or suffix == ".json":
+            fmt = "json"
+        elif "Text" in selected or suffix == ".txt":
+            fmt = "normal"
+        elif "XML" in selected or suffix == ".xml":
+            fmt = "xml"
+        elif "Grepable" in selected or suffix == ".gnmap":
+            fmt = "grepable"
+
         try:
-            if path.suffix.lower() == ".json" or "JSON" in selected:
-                with path.open("w", encoding="utf-8") as f:
-                    json.dump([h.to_dict() for h in hosts], f, ensure_ascii=False, indent=2)
-            else:
-                with path.open("w", encoding="utf-8", newline="") as f:
-                    writer = csv.DictWriter(
-                        f,
-                        fieldnames=["ip", "alive", "hostname", "mac", "vendor", "response_ms", "open_ports"],
-                    )
-                    writer.writeheader()
-                    for h in hosts:
-                        writer.writerow(h.to_dict())
+            self._write_results(path, hosts, fmt)
         except OSError as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл:\n{e}")
             return
@@ -1508,7 +1921,7 @@ class WifiTab(QWidget):
         rtt: float | None = None
         if gw:
             try:
-                alive, rtt_value = ping(gw, timeout_ms=500)
+                alive, rtt_value, _ttl = ping(gw, timeout_ms=500)
                 if alive and rtt_value is not None:
                     rtt = rtt_value
                 arp = _parse_arp_table()
