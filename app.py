@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import threading
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -75,6 +76,7 @@ from PySide6.QtWidgets import (
 
 from scanner import (
     COMMON_PORTS,
+    PORT_SOFTWARE,
     Host,
     IS_WINDOWS,
     TOP_PORTS,
@@ -86,6 +88,7 @@ from scanner import (
     lookup_vendor,
     ping,
     scan_network,
+    service_for_port,
 )
 
 
@@ -1236,6 +1239,15 @@ class ScanTab(QWidget):
                 lambda: self._ssh_connect(host),
             )
             menu.addSeparator()
+        # Per-host ports drill-down — the dialog handles the empty
+        # case itself (so we don't have to duplicate that logic here),
+        # which means the entry is always offered.
+        port_count = len(host.open_ports or [])
+        port_label = (
+            f"Порты… ({port_count})" if port_count else "Порты…"
+        )
+        menu.addAction(port_label, lambda: self._show_ports_dialog(host))
+        menu.addSeparator()
         if host.ip:
             menu.addAction(
                 f"Копировать IP — {host.ip}",
@@ -1321,6 +1333,18 @@ class ScanTab(QWidget):
             ",".join(str(p) for p in host.open_ports),
         ]
         self._copy_to_clipboard("\t".join(parts), "вся строка")
+
+    # ---------- Per-host ports dialog ----------
+    def _show_ports_dialog(self, host: Host) -> None:
+        """Open the open-ports drill-down for ``host``.
+
+        The dialog is parented to this tab so its modality is scoped
+        to the scan view (the user can still switch tabs with the
+        keyboard if they want to). Lifetime is managed implicitly:
+        the dialog is created on the stack of an event handler and
+        deleted when ``exec()`` returns.
+        """
+        HostPortsDialog(host, self).exec()
 
     # ---------- SSH ----------
     def _ssh_connect(self, host: Host) -> None:
@@ -2198,6 +2222,136 @@ class MassScanWorker(QObject):
             self.finished.emit()
 
 
+class MassExportDialog(QDialog):
+    """Pre-export dialog for the mass-scan tab.
+
+    Lets the user pick which columns end up in the file (so they can
+    grab "just IPs" for piping into other tools, or every column for
+    full record-keeping) plus a format. Held separately from
+    QFileDialog because the standard file dialog can't carry per-field
+    selection.
+    """
+
+    # The full set of columns in the order they appear in the table /
+    # internal results list. ``key`` matches ``MassScanTab._results``
+    # tuple positions, ``label`` is what the user sees in the checkbox
+    # and what becomes the CSV / TSV header for that column.
+    FIELDS: tuple[tuple[str, str], ...] = (
+        ("ip",      "IP-адрес"),
+        ("port",    "Порт"),
+        ("status",  "Статус"),
+        ("rtt_ms",  "Отклик (мс)"),
+    )
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Что экспортировать")
+        self.setModal(True)
+        self.resize(420, 360)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        info = QLabel(
+            "Выберите, какие столбцы попадут в файл, и в каком "
+            "формате его сохранить."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #94e2d5; font-style: italic;")
+        root.addWidget(info)
+
+        # ---- Field checkboxes ----
+        fbox = QGroupBox("Поля")
+        fl = QVBoxLayout(fbox)
+        fl.setSpacing(4)
+        self._field_checks: dict[str, QCheckBox] = {}
+        for key, label in self.FIELDS:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            self._field_checks[key] = cb
+            fl.addWidget(cb)
+        root.addWidget(fbox)
+
+        # ---- Quick presets ----
+        presets = QHBoxLayout()
+        presets.addWidget(QLabel("Пресеты:"))
+        btn_only_ip = QPushButton("Только IP")
+        btn_only_ip.clicked.connect(self._preset_only_ip)
+        presets.addWidget(btn_only_ip)
+        btn_ip_port = QPushButton("IP + порт")
+        btn_ip_port.clicked.connect(self._preset_ip_port)
+        presets.addWidget(btn_ip_port)
+        btn_all = QPushButton("Все поля")
+        btn_all.clicked.connect(self._preset_all)
+        presets.addWidget(btn_all)
+        presets.addStretch(1)
+        root.addLayout(presets)
+
+        # ---- Format ----
+        fmt_box = QGroupBox("Формат")
+        fmt_layout = QVBoxLayout(fmt_box)
+        self.cmb_fmt = QComboBox()
+        # data: (extension, separator, with_header)
+        self.cmb_fmt.addItem("CSV с заголовком (.csv)",   ("csv", ",",  True))
+        self.cmb_fmt.addItem("TSV с заголовком (.tsv)",   ("tsv", "\t", True))
+        self.cmb_fmt.addItem("Текст без заголовка (.txt)", ("txt", " ",  False))
+        fmt_layout.addWidget(self.cmb_fmt)
+        root.addWidget(fmt_box)
+
+        root.addStretch(1)
+
+        # ---- Buttons ----
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_ok = QPushButton("Далее…")
+        btn_ok.setDefault(True)
+        btn_ok.setObjectName("scan")
+        btn_ok.clicked.connect(self._on_accept)
+        btn_row.addWidget(btn_ok)
+        root.addLayout(btn_row)
+
+    # ----- Preset shortcuts -----
+    def _preset_only_ip(self) -> None:
+        for k, cb in self._field_checks.items():
+            cb.setChecked(k == "ip")
+        # "Только IP" is most useful as a flat list — pre-pick the
+        # text-without-header format to match the typical workflow.
+        self.cmb_fmt.setCurrentIndex(2)
+
+    def _preset_ip_port(self) -> None:
+        for k, cb in self._field_checks.items():
+            cb.setChecked(k in {"ip", "port"})
+        # For "IP + порт" CSV is the right default.
+        self.cmb_fmt.setCurrentIndex(0)
+
+    def _preset_all(self) -> None:
+        for cb in self._field_checks.values():
+            cb.setChecked(True)
+        self.cmb_fmt.setCurrentIndex(0)
+
+    # ----- Result API -----
+    def _on_accept(self) -> None:
+        if not any(cb.isChecked() for cb in self._field_checks.values()):
+            QMessageBox.warning(
+                self, "Нет полей",
+                "Выберите хотя бы одно поле для экспорта.",
+            )
+            return
+        self.accept()
+
+    def get_choice(self) -> tuple[list[str], str, str, bool]:
+        """Return ``(fields, ext, separator, with_header)`` for the writer."""
+        fields = [k for k, cb in self._field_checks.items() if cb.isChecked()]
+        ext, sep, with_header = self.cmb_fmt.currentData()
+        return fields, ext, sep, with_header
+
+
 class MassScanTab(QWidget):
     """Tab for scanning a user-supplied list of IPs against a single port.
 
@@ -2598,33 +2752,81 @@ class MassScanTab(QWidget):
             blob = f"{it.text(0)} {it.text(1)}".lower()
             it.setHidden(needle not in blob)
 
+    @staticmethod
+    def _format_row(
+        ip: str, port: int, status: str, rtt: float, fields: list[str]
+    ) -> list[str]:
+        """Slice one result tuple to just the columns the user picked."""
+        full = {
+            "ip":     ip,
+            "port":   str(port),
+            "status": status,
+            "rtt_ms": f"{rtt:.1f}",
+        }
+        return [full[f] for f in fields]
+
     def export_results(self) -> None:
         if not self._results:
             QMessageBox.information(
                 self, "Нет данных", "Сначала запустите сканирование."
             )
             return
-        default = f"mass_scan_{datetime.now():%Y%m%d_%H%M%S}.csv"
+
+        # Step 1: ask which columns + which format.
+        dlg = MassExportDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        fields, ext, sep, with_header = dlg.get_choice()
+        if not fields:
+            # Defensive — the dialog already enforces this, but keep
+            # the writer guarded anyway.
+            return
+
+        # Step 2: pick a path. Default name uses the format extension
+        # so the user doesn't have to remember to type it.
+        default = f"mass_scan_{datetime.now():%Y%m%d_%H%M%S}.{ext}"
+        filter_label = {
+            "csv": "CSV (*.csv)",
+            "tsv": "TSV (*.tsv)",
+            "txt": "Текст (*.txt)",
+        }[ext]
         path_str, _ = QFileDialog.getSaveFileName(
             self, "Экспорт результатов", default,
-            "CSV (*.csv);;Текст (*.txt);;Все файлы (*.*)",
+            f"{filter_label};;Все файлы (*.*)",
         )
         if not path_str:
             return
         path = Path(path_str)
+
+        # Header label for each column (uses the Russian label from the
+        # dialog so the file is friendly to whoever opens it later).
+        labels: dict[str, str] = dict(MassExportDialog.FIELDS)
+
         try:
             with path.open("w", encoding="utf-8", newline="") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(["ip", "port", "status", "rtt_ms"])
-                for ip, port, status, rtt in self._results:
-                    writer.writerow([ip, port, status, f"{rtt:.1f}"])
+                if ext == "csv":
+                    writer = csv.writer(fh)
+                    if with_header:
+                        writer.writerow([labels[f] for f in fields])
+                    for row in self._results:
+                        writer.writerow(self._format_row(*row, fields))
+                else:
+                    if with_header:
+                        fh.write(sep.join(labels[f] for f in fields) + "\n")
+                    for row in self._results:
+                        fh.write(
+                            sep.join(self._format_row(*row, fields)) + "\n"
+                        )
         except OSError as exc:
             QMessageBox.critical(
                 self, "Ошибка", f"Не удалось сохранить файл:\n{exc}"
             )
             return
+
         QMessageBox.information(
-            self, "Готово", f"Сохранено {len(self._results)} строк:\n{path}"
+            self, "Готово",
+            f"Сохранено {len(self._results)} строк "
+            f"({len(fields)} столбц.) в файл:\n{path}",
         )
 
     def shutdown(self) -> None:
@@ -2633,6 +2835,319 @@ class MassScanTab(QWidget):
         if self._thread and self._thread.isRunning():
             self._thread.quit()
             self._thread.wait(2000)
+
+
+# ---------------------------------------------------------------------------
+# About tab + per-host ports dialog
+# ---------------------------------------------------------------------------
+
+# Repo on GitHub — used by the About tab and is the canonical place
+# for users to file issues, see the changelog, and grab updates.
+GITHUB_URL = "https://github.com/Pomidor8639/IPbrowse"
+
+
+def _google_search_url_for_port(port: int, proto: str = "tcp") -> str:
+    """Build a Google-search URL describing ``port`` / ``proto``.
+
+    Intentionally a search URL rather than a direct Wikipedia / IANA
+    link: a plain ``port 22 tcp service`` query consistently surfaces
+    a Wikipedia page, the IANA registry entry, SpeedGuide, and recent
+    security write-ups in the top results — which is what someone
+    investigating an unexpected open port actually wants.
+    """
+    query = f"port {port} {proto} service"
+    return "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+
+
+class AboutTab(QWidget):
+    """Static "About" tab: project description, features, useful links.
+
+    Built once at startup; no live data so nothing here interacts
+    with the scanner. ``QLabel.setOpenExternalLinks(True)`` makes the
+    embedded ``<a>`` tags click-through to the system browser via
+    :class:`QDesktopServices`.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # Wrap everything in a scroll area so the tab stays usable on
+        # smaller window sizes — the description block is reasonably
+        # tall once features and links are listed.
+        from PySide6.QtWidgets import QScrollArea
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer.addWidget(scroll)
+
+        body = QWidget()
+        scroll.setWidget(body)
+        root = QVBoxLayout(body)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
+
+        # ---- Header ----
+        title = QLabel("IPbrowse")
+        title_font = QFont()
+        title_font.setPointSize(22)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet("color: #89b4fa;")
+        root.addWidget(title)
+
+        subtitle = QLabel(
+            "Сканер локальной сети с графическим интерфейсом на "
+            "Python и PySide6"
+        )
+        subtitle.setStyleSheet("color: #94e2d5; font-style: italic;")
+        subtitle.setWordWrap(True)
+        root.addWidget(subtitle)
+
+        # ---- Description ----
+        desc = QLabel(
+            "IPbrowse находит активные устройства в подсети, "
+            "определяет имена хостов, MAC-адреса и производителей по "
+            "OUI, сканирует открытые TCP-порты и подбирает баннеры "
+            "сервисов. Поддерживает массовое сканирование списка "
+            "адресов из файла, экспорт результатов в CSV / TSV / TXT "
+            "и быстрое подключение по SSH прямо из таблицы."
+        )
+        desc.setWordWrap(True)
+        root.addWidget(desc)
+
+        # ---- Features ----
+        features_title = QLabel("Возможности")
+        f_font = QFont()
+        f_font.setBold(True)
+        f_font.setPointSize(14)
+        features_title.setFont(f_font)
+        features_title.setStyleSheet("color: #cba6f7; padding-top: 8px;")
+        root.addWidget(features_title)
+
+        features = QLabel(
+            "<ul style='margin-left:0; -qt-list-indent: 1;'>"
+            "<li>Ping-сканирование подсетей, диапазонов и одиночных IP "
+            "(CIDR / range / список)</li>"
+            "<li>Определение имени хоста (reverse DNS) и MAC-адреса "
+            "из ARP-таблицы</li>"
+            "<li>Производитель устройства по OUI (mac-vendor-lookup)</li>"
+            "<li>Сканирование TCP-портов, в том числе пользовательских "
+            "наборов и пресетов в стиле <code>nmap --top-ports</code></li>"
+            "<li>Снятие баннеров сервисов (-sV) и грубое определение ОС "
+            "по TTL (-O)</li>"
+            "<li>Wi-Fi: текущая сеть, шлюз, информация о роутере</li>"
+            "<li>Массовое сканирование одного порта по списку IP "
+            "(до 800 потоков)</li>"
+            "<li>Фильтрация и сортировка результатов в реальном времени, "
+            "копирование IP / MAC / строки целиком</li>"
+            "<li>Экспорт результатов в CSV / TSV / TXT с выбором "
+            "колонок и пресетами</li>"
+            "<li>Тёмная тема Catppuccin</li>"
+            "</ul>"
+        )
+        features.setTextFormat(Qt.RichText)
+        features.setWordWrap(True)
+        root.addWidget(features)
+
+        # ---- Tip about port lookups ----
+        tip = QLabel(
+            "<b>Совет.</b> Кликните по строке хоста в любой вкладке "
+            "сканирования и выберите пункт <i>«Порты…»</i> — откроется "
+            "список открытых портов с расшифровкой сервиса и кнопкой "
+            "«Загуглить» для каждого порта."
+        )
+        tip.setTextFormat(Qt.RichText)
+        tip.setWordWrap(True)
+        tip.setStyleSheet(
+            "background: #313244; border-radius: 6px; padding: 10px;"
+        )
+        root.addWidget(tip)
+
+        # ---- Links ----
+        links_title = QLabel("Ссылки")
+        links_title.setFont(f_font)
+        links_title.setStyleSheet("color: #cba6f7; padding-top: 8px;")
+        root.addWidget(links_title)
+
+        links = QLabel(
+            f'<ul style="margin-left:0; -qt-list-indent: 1;">'
+            f'<li>GitHub: <a href="{GITHUB_URL}" '
+            f'style="color:#89b4fa;">{GITHUB_URL}</a></li>'
+            f'<li>Сообщить о проблеме: '
+            f'<a href="{GITHUB_URL}/issues" '
+            f'style="color:#89b4fa;">{GITHUB_URL}/issues</a></li>'
+            f'<li>Лицензия: '
+            f'<a href="{GITHUB_URL}/blob/main/LICENSE" '
+            f'style="color:#89b4fa;">MIT</a></li>'
+            f'<li>Реестр портов IANA: '
+            f'<a href="https://www.iana.org/assignments/'
+            f'service-names-port-numbers/'
+            f'service-names-port-numbers.xhtml" '
+            f'style="color:#89b4fa;">'
+            f'iana.org/assignments/service-names-port-numbers</a></li>'
+            f'</ul>'
+        )
+        links.setTextFormat(Qt.RichText)
+        links.setOpenExternalLinks(True)
+        links.setWordWrap(True)
+        root.addWidget(links)
+
+        # ---- Tech stack / footer ----
+        try:
+            import PySide6
+            pyside_version = PySide6.__version__
+        except Exception:
+            pyside_version = "?"
+        py_version = (
+            f"{sys.version_info.major}.{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        )
+        footer = QLabel(
+            f"Python {py_version} · PySide6 {pyside_version} · "
+            f"Реестр портов IANA включён в комплект (ports.csv)"
+        )
+        footer.setStyleSheet("color: #6c7086; padding-top: 10px;")
+        footer.setWordWrap(True)
+        root.addWidget(footer)
+
+        root.addStretch(1)
+
+
+class HostPortsDialog(QDialog):
+    """Modal listing of open ports on a single host.
+
+    Per row: port, IANA service name, curated software hint, plus a
+    "Загуглить" button that fires a Google-search URL describing the
+    port. The button is implemented via ``QTreeWidget.setItemWidget``
+    so users can act on individual rows without having to first select
+    them — that's the exact friction the user asked us to remove.
+
+    The dialog is also useful when ``host.open_ports`` is empty: we
+    show an explicit "Открытых портов не обнаружено" message so the
+    menu entry is never silently a no-op.
+    """
+
+    _COLUMNS: tuple[tuple[str, int], ...] = (
+        ("Порт",        80),
+        ("Сервис",      120),
+        ("Софт",        420),
+        ("",             140),  # action column — header kept blank
+    )
+
+    def __init__(
+        self, host: Host, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self._host = host
+
+        title_target = host.hostname or host.ip or "хост"
+        self.setWindowTitle(f"Открытые порты — {title_target}")
+        self.setModal(True)
+        self.resize(820, 460)
+        self._build_ui()
+        self._populate()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        host = self._host
+        head_lines = [f"<b>{host.ip or '—'}</b>"]
+        if host.hostname:
+            head_lines.append(host.hostname)
+        if host.mac:
+            head_lines.append(host.mac.upper())
+        if host.vendor:
+            head_lines.append(host.vendor)
+        header = QLabel(" · ".join(head_lines))
+        header.setTextFormat(Qt.RichText)
+        header.setStyleSheet("color: #cdd6f4; font-size: 14px;")
+        header.setWordWrap(True)
+        root.addWidget(header)
+
+        intro = QLabel(
+            "Список открытых TCP-портов на этом хосте. Колонка "
+            "«Сервис» — имя из реестра IANA, «Софт» — типичные "
+            "программы, которые слушают на этом порту. Кнопка "
+            "«Загуглить» открывает поиск с описанием порта в "
+            "браузере."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #94e2d5; font-style: italic;")
+        root.addWidget(intro)
+
+        self.table = QTreeWidget()
+        self.table.setColumnCount(len(self._COLUMNS))
+        self.table.setHeaderLabels([h for h, _w in self._COLUMNS])
+        self.table.setRootIsDecorated(False)
+        self.table.setUniformRowHeights(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        for i, (_h, w) in enumerate(self._COLUMNS):
+            self.table.setColumnWidth(i, w)
+        self.table.header().setStretchLastSection(False)
+        root.addWidget(self.table, 1)
+
+        # Bulk action: open every port's Google query at once when the
+        # user wants a wide-net look (only enabled if there's at least
+        # one port to act on — set in ``_populate``).
+        btn_row = QHBoxLayout()
+        self.btn_google_all = QPushButton("Загуглить все")
+        self.btn_google_all.clicked.connect(self._google_all)
+        self.btn_google_all.setEnabled(False)
+        btn_row.addWidget(self.btn_google_all)
+        btn_row.addStretch(1)
+        btn_close = QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        btn_close.setDefault(True)
+        btn_row.addWidget(btn_close)
+        root.addLayout(btn_row)
+
+    def _populate(self) -> None:
+        ports = list(self._host.open_ports or [])
+        if not ports:
+            empty = QTreeWidgetItem(["", "Открытых портов не обнаружено", "", ""])
+            empty.setFlags(empty.flags() & ~Qt.ItemIsSelectable)
+            empty.setForeground(1, QBrush(QColor("#6c7086")))
+            self.table.addTopLevelItem(empty)
+            return
+
+        self.btn_google_all.setEnabled(True)
+        for port in ports:
+            service = service_for_port(port, "tcp")
+            software = PORT_SOFTWARE.get(port, "")
+            it = QTreeWidgetItem([str(port), service, software, ""])
+            # Long software notes deserve a tooltip so they're not lost
+            # when the column is narrowed.
+            if software:
+                it.setToolTip(2, software)
+            self.table.addTopLevelItem(it)
+
+            btn = QPushButton("Загуглить")
+            btn.setObjectName("scan")  # picks up the accent style
+            btn.clicked.connect(
+                # Capture ``port`` by default-arg so each row's lambda
+                # binds to its own value rather than the loop variable.
+                lambda _checked=False, p=port: self._google_one(p)
+            )
+            self.table.setItemWidget(it, 3, btn)
+
+    def _google_one(self, port: int) -> None:
+        QDesktopServices.openUrl(
+            QUrl(_google_search_url_for_port(port, "tcp"))
+        )
+
+    def _google_all(self) -> None:
+        for port in self._host.open_ports or []:
+            QDesktopServices.openUrl(
+                QUrl(_google_search_url_for_port(port, "tcp"))
+            )
 
 
 class MainWindow(QMainWindow):
@@ -2661,11 +3176,13 @@ class MainWindow(QMainWindow):
         )
         self.wifi_tab = WifiTab(local_model=self.local_tab.model)
         self.mass_tab = MassScanTab()
+        self.about_tab = AboutTab()
 
         self.tabs.addTab(self.local_tab, "Локальная сеть")
         self.tabs.addTab(self.external_tab, "Внешние сети")
         self.tabs.addTab(self.wifi_tab, "Wi-Fi")
         self.tabs.addTab(self.mass_tab, "Массовое сканирование")
+        self.tabs.addTab(self.about_tab, "О программе")
 
         self._apply_dark_theme()
 

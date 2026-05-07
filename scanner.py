@@ -1,6 +1,7 @@
 """Network scanning utilities: ping sweep, ARP lookup, hostname resolution, port scan."""
 from __future__ import annotations
 
+import csv
 import ipaddress
 import locale
 import platform
@@ -10,6 +11,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
 IS_WINDOWS = platform.system().lower() == "windows"
@@ -80,6 +82,344 @@ TOP_PORTS: tuple[int, ...] = (
     8080, 8081, 8443, 8888, 9100, 9999, 10000, 32768, 49152, 49153,
     49154, 49155, 49156, 49157,
 )
+
+
+# Curated mapping ``port -> typical software``. Used by the "Порты"
+# tab to enrich the IANA service registry with information that IANA
+# itself doesn't carry (vendor / OSS implementations, well-known
+# default ports of products that aren't formally registered, etc.).
+#
+# Multiple comma-separated entries are intentional: many ports are
+# shared by several implementations (e.g. 80 by Apache / nginx / IIS),
+# and seeing them together is more informative than just the protocol
+# name. Where a port is famously used by malware as well, that's
+# called out so a user reviewing scan output isn't surprised by an
+# "RDP" hit on a workstation that shouldn't have RDP exposed.
+PORT_SOFTWARE: dict[int, str] = {
+    20:    "FTP-данные — vsftpd, ProFTPD, Pure-FTPd, IIS",
+    21:    "FTP — vsftpd, ProFTPD, Pure-FTPd, FileZilla Server, IIS FTP",
+    22:    "SSH / SFTP — OpenSSH, Dropbear, libssh, Bitvise SSH",
+    23:    "Telnet — telnetd; маршрутизаторы и IoT (опасно открытым)",
+    25:    "SMTP — Postfix, Exim, Sendmail, Microsoft Exchange",
+    37:    "Time protocol",
+    43:    "WHOIS",
+    53:    "DNS — BIND, Unbound, dnsmasq, PowerDNS, systemd-resolved",
+    67:    "DHCP-сервер — ISC DHCP, dnsmasq, Kea, Windows DHCP",
+    68:    "DHCP-клиент",
+    69:    "TFTP — tftpd-hpa, atftp, SolarWinds TFTP",
+    79:    "Finger",
+    80:    "HTTP — Apache httpd, nginx, IIS, Caddy, lighttpd, Tomcat",
+    81:    "HTTP-Alt — веб-админки роутеров, Tor",
+    88:    "Kerberos KDC — MIT Kerberos, Heimdal, Active Directory",
+    102:   "Siemens S7 PLC",
+    110:   "POP3 — Dovecot, Cyrus IMAP, Courier, Microsoft Exchange",
+    111:   "RPCbind / portmap (NFS, NIS)",
+    113:   "Ident",
+    119:   "NNTP — INN, leafnode",
+    123:   "NTP — ntpd, chrony, Windows w32time",
+    135:   "Microsoft RPC Endpoint Mapper (DCE/RPC)",
+    137:   "NetBIOS Name — Samba nmbd, Windows",
+    138:   "NetBIOS Datagram — Samba nmbd, Windows",
+    139:   "NetBIOS Session — Samba smbd, Windows File Sharing",
+    143:   "IMAP — Dovecot, Cyrus, Courier, Microsoft Exchange",
+    161:   "SNMP — Net-SNMP, оборудование Cisco / Juniper / MikroTik",
+    162:   "SNMP-trap — Net-SNMP, Zabbix, Nagios, PRTG",
+    179:   "BGP — FRRouting, Quagga, BIRD, Cisco IOS, Juniper",
+    194:   "IRC — UnrealIRCd, InspIRCd, ircd-hybrid",
+    389:   "LDAP — OpenLDAP, Active Directory, 389 Directory Server",
+    427:   "SLP — OpenSLP",
+    443:   "HTTPS — Apache, nginx, IIS, Caddy + TLS, HTTP/2, HTTP/3",
+    445:   "SMB — Samba smbd, Windows File Sharing (атаки EternalBlue)",
+    465:   "SMTPS — Postfix, Exim, Sendmail",
+    500:   "IKE/IPsec — strongSwan, Libreswan, Windows IKE",
+    502:   "Modbus TCP — промышленные ПЛК",
+    513:   "rlogin",
+    514:   "Syslog / rsh — rsyslog, syslog-ng",
+    515:   "LPD — CUPS, lpd",
+    520:   "RIP — FRRouting, gated",
+    523:   "IBM DB2",
+    546:   "DHCPv6 client",
+    547:   "DHCPv6 server — ISC DHCP, Kea",
+    548:   "AFP — netatalk (Apple File Sharing)",
+    554:   "RTSP — Live555, GStreamer; IP-камеры (Hikvision, Dahua)",
+    587:   "SMTP submission — Postfix, Exim, Sendmail",
+    593:   "RPC over HTTP — Microsoft Exchange (Outlook Anywhere)",
+    623:   "IPMI — BMC: Dell iDRAC, HPE iLO, Supermicro",
+    631:   "IPP / CUPS — печать",
+    636:   "LDAPS — OpenLDAP, Active Directory + TLS",
+    873:   "rsync (демон)",
+    902:   "VMware ESXi authd / vCenter",
+    989:   "FTPS-данные",
+    990:   "FTPS-управление — vsftpd, FileZilla Server, IIS",
+    993:   "IMAPS — Dovecot, Microsoft Exchange",
+    995:   "POP3S — Dovecot, Microsoft Exchange",
+    1025:  "Windows RPC dynamic / Microsoft network blackjack",
+    1080:  "SOCKS-прокси — Dante, 3proxy",
+    1194:  "OpenVPN",
+    1352:  "Lotus Notes / Domino",
+    1433:  "Microsoft SQL Server",
+    1434:  "Microsoft SQL Server browser (UDP)",
+    1521:  "Oracle DB listener",
+    1701:  "L2TP — strongSwan, xl2tpd",
+    1723:  "PPTP",
+    1812:  "RADIUS auth — FreeRADIUS, Cisco ACS, Microsoft NPS",
+    1813:  "RADIUS accounting — FreeRADIUS, Microsoft NPS",
+    1883:  "MQTT — Mosquitto, EMQX, HiveMQ",
+    1900:  "SSDP / UPnP — miniupnpd, Windows SSDP",
+    2000:  "Cisco SCCP / IOS HTTP",
+    2049:  "NFS — nfsd, Linux/FreeBSD NFS, Windows Services for NFS",
+    2082:  "cPanel HTTP",
+    2083:  "cPanel HTTPS",
+    2086:  "WHM HTTP",
+    2087:  "WHM HTTPS",
+    2095:  "cPanel Webmail",
+    2096:  "cPanel Webmail (TLS)",
+    2181:  "Apache ZooKeeper",
+    2222:  "DirectAdmin / SSH alt",
+    2375:  "Docker daemon (без TLS — опасно открытым!)",
+    2376:  "Docker daemon (TLS)",
+    2483:  "Oracle DB (без TLS)",
+    2484:  "Oracle DB (TLS)",
+    3000:  "Grafana, Node.js dev, Ruby on Rails",
+    3128:  "Squid proxy",
+    3260:  "iSCSI",
+    3268:  "Active Directory Global Catalog",
+    3269:  "Active Directory Global Catalog (TLS)",
+    3306:  "MySQL / MariaDB",
+    3389:  "RDP — Windows Remote Desktop, xrdp, FreeRDP",
+    3478:  "STUN/TURN — coturn, Janus",
+    3690:  "Subversion (svnserve)",
+    4369:  "EPMD — Erlang Port Mapper (RabbitMQ, CouchDB, ejabberd)",
+    4444:  "Metasploit Meterpreter (по умолчанию) — подозрительно",
+    4500:  "IPsec NAT-T",
+    4567:  "Galera replication",
+    4789:  "VXLAN",
+    4848:  "GlassFish admin",
+    5000:  "UPnP / Flask dev / Docker registry / Synology DSM",
+    5001:  "Synology DSM HTTPS",
+    5060:  "SIP — Asterisk, FreeSWITCH, Kamailio, OpenSIPS",
+    5061:  "SIP-TLS",
+    5222:  "XMPP-клиент — ejabberd, Prosody, Openfire",
+    5269:  "XMPP server-to-server",
+    5353:  "mDNS — Avahi, Apple Bonjour, systemd-resolved",
+    5355:  "LLMNR — Windows",
+    5432:  "PostgreSQL",
+    5601:  "Kibana",
+    5672:  "AMQP — RabbitMQ, Qpid, ActiveMQ",
+    5800:  "VNC over HTTP — RealVNC, TightVNC",
+    5900:  "VNC — TigerVNC, RealVNC, TightVNC, x11vnc",
+    5938:  "TeamViewer",
+    5984:  "Apache CouchDB",
+    5985:  "WinRM HTTP",
+    5986:  "WinRM HTTPS",
+    6000:  "X11-сервер",
+    6379:  "Redis",
+    6443:  "Kubernetes API server",
+    6660:  "IRC",
+    6667:  "IRC — UnrealIRCd, InspIRCd",
+    6697:  "IRC TLS",
+    6881:  "BitTorrent",
+    7000:  "Cassandra inter-node / Apple AirPlay",
+    7001:  "Oracle WebLogic",
+    7077:  "Apache Spark master",
+    7547:  "TR-069 / CWMP — модемы провайдеров (атака Mirai)",
+    7777:  "iChat / различные игровые серверы",
+    8000:  "HTTP-Alt — Django dev, python -m http.server",
+    8008:  "HTTP-Alt — IBM HTTP, Matrix homeserver",
+    8009:  "AJP — Apache Tomcat (CVE-2020-1938 Ghostcat)",
+    8080:  "HTTP-Alt — Tomcat, Jenkins, прокси, веб-админки роутеров",
+    8086:  "InfluxDB",
+    8088:  "Hadoop YARN ResourceManager UI",
+    8089:  "Splunkd",
+    8123:  "Home Assistant",
+    8200:  "HashiCorp Vault",
+    8333:  "Bitcoin core",
+    8443:  "HTTPS-Alt — Tomcat, веб-админки, Plesk",
+    8530:  "WSUS HTTP",
+    8531:  "WSUS HTTPS",
+    8649:  "Ganglia",
+    8888:  "HTTP-Alt — Jupyter, JIRA, GNU Health",
+    9000:  "PHP-FPM, SonarQube, Portainer, MinIO, ClickHouse",
+    9042:  "Apache Cassandra CQL",
+    9090:  "Prometheus, Cockpit",
+    9092:  "Apache Kafka",
+    9100:  "Сетевой принтер (HP JetDirect), Prometheus node_exporter",
+    9200:  "Elasticsearch HTTP",
+    9300:  "Elasticsearch transport",
+    9418:  "Git daemon",
+    9999:  "Urchin / cPanel WHM",
+    10000: "Webmin / Virtualmin / NDMP",
+    10050: "Zabbix agent",
+    10051: "Zabbix server",
+    11211: "Memcached",
+    15672: "RabbitMQ management UI",
+    16992: "Intel AMT HTTP",
+    16993: "Intel AMT HTTPS",
+    19132: "Minecraft Bedrock Edition",
+    25565: "Minecraft Java Edition",
+    27015: "Source-движок (CS, TF2, Garry's Mod)",
+    27017: "MongoDB",
+    27018: "MongoDB shard",
+    27019: "MongoDB config server",
+    32400: "Plex Media Server",
+    49152: "Windows RPC dynamic / UPnP",
+}
+
+
+# ---------------------------------------------------------------------------
+# IANA registry loader
+# ---------------------------------------------------------------------------
+
+# ``ports.csv`` is a cleaned-up snapshot of the official IANA Service
+# Names and Port Numbers registry — see the project README for the
+# build steps. Keeping it as a sibling file (rather than a giant
+# Python literal) keeps ``scanner.py`` reasonable to read and lets
+# users update the registry without touching code.
+PORTS_CSV_PATH: Path = Path(__file__).resolve().parent / "ports.csv"
+
+
+_PORTS_CACHE: list[tuple[str, str, str, str, str]] | None = None
+
+
+def load_ports_registry(
+    path: Path | str = PORTS_CSV_PATH,
+) -> list[tuple[str, str, str, str, str]]:
+    """Return the IANA registry rows + curated software annotation.
+
+    Each tuple is ``(port, protocol, service, software, description)``,
+    where ``software`` comes from :data:`PORT_SOFTWARE` for known
+    ports (and is empty otherwise). ``port`` is kept as a string
+    because IANA occasionally registers ranges (e.g. ``"1024-1027"``).
+    Result is cached so the GUI can rebuild filters cheaply on every
+    keystroke.
+
+    Returns an empty list if the file is missing — the dialog falls
+    back to the small built-in :data:`COMMON_PORTS` table in that
+    case, so the app stays usable on a stripped-down deployment.
+    """
+    global _PORTS_CACHE
+    if _PORTS_CACHE is not None:
+        return _PORTS_CACHE
+
+    p = Path(path)
+    rows: list[tuple[str, str, str, str, str]] = []
+    if not p.is_file():
+        _PORTS_CACHE = rows
+        return rows
+
+    try:
+        with p.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for r in reader:
+                port = (r.get("port") or "").strip()
+                proto = (r.get("protocol") or "").strip()
+                service = (r.get("service") or "").strip()
+                desc = (r.get("description") or "").strip()
+                if not port:
+                    continue
+                # Software annotation is only meaningful for a single
+                # numeric port — don't try to split ranges across the
+                # curated map. The vast majority of ranges in the
+                # registry are tiny vendor blocks anyway.
+                software = ""
+                if port.isdigit():
+                    software = PORT_SOFTWARE.get(int(port), "")
+                rows.append((port, proto, service, software, desc))
+    except OSError:
+        # File races / permission issues shouldn't crash the GUI;
+        # an empty registry is a survivable fallback.
+        rows = []
+
+    # Top up the registry with synthetic rows for ports we have a
+    # software note for but which IANA has never formally registered
+    # (port 81, Bitcoin/Minecraft/etc.). Without this, searching the
+    # tab for "minecraft" or "TeamViewer" comes up empty even though
+    # the curated annotation exists.
+    have_ports: set[int] = set()
+    for r in rows:
+        port_str = r[0]
+        if port_str.isdigit():
+            have_ports.add(int(port_str))
+
+    # Per-port protocol overrides for synthetic entries — defaults to
+    # ("tcp",) which covers the majority. UDP-only or dual-protocol
+    # cases are listed explicitly so the protocol filter stays honest.
+    _SYNTH_PROTOS: dict[int, tuple[str, ...]] = {
+        8649:  ("udp",),
+        19132: ("udp",),
+        27015: ("tcp", "udp"),
+        49152: ("tcp", "udp"),
+    }
+    for port_num, software in PORT_SOFTWARE.items():
+        if port_num in have_ports:
+            continue
+        for proto in _SYNTH_PROTOS.get(port_num, ("tcp",)):
+            rows.append((str(port_num), proto, "", software, ""))
+
+    _PORTS_CACHE = rows
+    return rows
+
+
+# Lazy lookup indices over the IANA registry. Held separately from
+# ``_PORTS_CACHE`` so the CLI / non-GUI callers don't pay the cost of
+# building them, and split into ``(port, proto)`` exact and
+# ``port`` any-proto fallback maps so we don't have to mix key types.
+_SERVICE_BY_PORT_PROTO: dict[tuple[int, str], str] | None = None
+_SERVICE_BY_PORT: dict[int, str] | None = None
+
+
+def _build_service_indices() -> None:
+    global _SERVICE_BY_PORT_PROTO, _SERVICE_BY_PORT
+    by_pp: dict[tuple[int, str], str] = {}
+    by_p: dict[int, str] = {}
+    for p_str, p_proto, service, _sw, _desc in load_ports_registry():
+        if not service or not p_str.isdigit():
+            continue
+        n = int(p_str)
+        key = (n, p_proto.lower())
+        by_pp.setdefault(key, service)
+        # First service we encounter for the port wins as the
+        # any-proto fallback. ``ports.csv`` is sorted such that the
+        # canonical entry usually appears first.
+        by_p.setdefault(n, service)
+    _SERVICE_BY_PORT_PROTO = by_pp
+    _SERVICE_BY_PORT = by_p
+
+
+def service_for_port(port: int, proto: str = "tcp") -> str:
+    """Return a human-readable service name for ``port``.
+
+    Lookup order:
+
+    1. The built-in :data:`COMMON_PORTS` table — short, capitalised
+       Russian-friendly labels (``"SSH"``, ``"HTTP"``, …) that match
+       what the rest of the GUI already shows.
+    2. The IANA registry loaded from ``ports.csv``. If both ``port``
+       and ``proto`` match, that entry wins; otherwise we fall back
+       to the first registered service for ``port`` regardless of
+       transport.
+
+    Returns ``""`` when the port isn't known. ``proto`` is matched
+    case-insensitively against the protocol column of the registry.
+    """
+    if not (0 <= port <= 65535):
+        return ""
+
+    # 1. Curated short labels first — these are what the user sees in
+    # the main scan-result table, so showing the same string in the
+    # ports dialog keeps the experience consistent.
+    common = COMMON_PORTS.get(port)
+    if common:
+        return common
+
+    # 2. IANA registry, exact (port, proto) match preferred.
+    if _SERVICE_BY_PORT_PROTO is None or _SERVICE_BY_PORT is None:
+        _build_service_indices()
+    assert _SERVICE_BY_PORT_PROTO is not None and _SERVICE_BY_PORT is not None
+    exact = _SERVICE_BY_PORT_PROTO.get((port, proto.lower()))
+    if exact:
+        return exact
+    return _SERVICE_BY_PORT.get(port, "")
 
 
 @dataclass
