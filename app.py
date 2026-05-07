@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 import threading
 from datetime import datetime
@@ -12,13 +13,25 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QObject,
+    QPointF,
     QSortFilterProxyModel,
     Qt,
     QThread,
     QTimer,
+    QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFont, QIcon
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QPainter,
+    QPen,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -38,6 +51,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStatusBar,
     QStyle,
+    QTabWidget,
     QTableView,
     QToolBar,
     QVBoxLayout,
@@ -47,8 +61,13 @@ from PySide6.QtWidgets import (
 from scanner import (
     COMMON_PORTS,
     Host,
+    _parse_arp_table,
     detect_local_subnet,
     expand_target,
+    get_default_gateway,
+    get_wifi_info,
+    lookup_vendor,
+    ping,
     scan_network,
 )
 
@@ -269,47 +288,151 @@ class ScanWorker(QObject):
             self.finished.emit()
 
 
-class MainWindow(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("IPbrowse — Сканер локальной сети")
-        self.resize(1100, 650)
+class SparklineWidget(QWidget):
+    """Lightweight live line chart used for the Wi-Fi tab graphs."""
 
+    def __init__(
+        self,
+        title: str = "",
+        unit: str = "",
+        color: str = "#89b4fa",
+        max_points: int = 120,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._title = title
+        self._unit = unit
+        self._color = QColor(color)
+        self._max_points = max_points
+        self._values: list[float] = []
+        self.setMinimumHeight(120)
+
+    def reset(self) -> None:
+        self._values.clear()
+        self.update()
+
+    def add_value(self, value: float) -> None:
+        self._values.append(float(value))
+        if len(self._values) > self._max_points:
+            del self._values[: len(self._values) - self._max_points]
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#181825"))
+        painter.setPen(QColor("#45475a"))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+
+        # Title with current value.
+        painter.setPen(QColor("#89b4fa"))
+        font = painter.font()
+        font.setPointSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        text = self._title
+        if self._values:
+            unit = f" {self._unit}" if self._unit else ""
+            text += f"  ({self._values[-1]:.1f}{unit})"
+        painter.drawText(8, 16, text)
+
+        if not self._values:
+            painter.setPen(QColor("#6c7086"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "нет данных")
+            return
+
+        chart = self.rect().adjusted(8, 24, -8, -8)
+        mn, mx = min(self._values), max(self._values)
+        if mx - mn < 1e-6:
+            mx = mn + 1
+        n = len(self._values)
+        points: list[QPointF] = []
+        for i, v in enumerate(self._values):
+            x = chart.left() + chart.width() * (i / max(1, n - 1))
+            y = chart.bottom() - chart.height() * (v - mn) / (mx - mn)
+            points.append(QPointF(x, y))
+
+        # Filled area under the curve.
+        fill = QColor(self._color)
+        fill.setAlpha(50)
+        poly = QPolygonF(
+            [QPointF(points[0].x(), chart.bottom())]
+            + points
+            + [QPointF(points[-1].x(), chart.bottom())]
+        )
+        painter.setBrush(QBrush(fill))
+        painter.setPen(Qt.NoPen)
+        painter.drawPolygon(poly)
+
+        # Curve.
+        pen = QPen(self._color)
+        pen.setWidth(2)
+        painter.setPen(pen)
+        for i in range(1, len(points)):
+            painter.drawLine(points[i - 1], points[i])
+
+
+class ScanTab(QWidget):
+    """Reusable scan view used for both local and external network tabs."""
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        default_target: str = "",
+        show_auto_detect: bool = True,
+        auto_start: bool = False,
+        warning_text: str = "",
+    ) -> None:
+        super().__init__(parent)
         self.model = HostsModel(self)
         self.proxy = QSortFilterProxyModel(self)
         self.proxy.setSourceModel(self.model)
-        self.proxy.setFilterKeyColumn(-1)  # all columns
+        self.proxy.setFilterKeyColumn(-1)
         self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
 
         self._thread: QThread | None = None
         self._worker: ScanWorker | None = None
 
-        self._build_ui()
-        self._apply_dark_theme()
+        self._build_ui(default_target, show_auto_detect, warning_text)
+        if auto_start:
+            QTimer.singleShot(0, self.start_scan)
 
     # ---------- UI ----------
-    def _build_ui(self) -> None:
-        central = QWidget(self)
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+    def _build_ui(self, default_target: str, show_auto_detect: bool, warning_text: str) -> None:
+        root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
+
+        if warning_text:
+            banner = QLabel(warning_text)
+            banner.setWordWrap(True)
+            banner.setObjectName("warningBanner")
+            banner.setStyleSheet(
+                "QLabel#warningBanner {"
+                " background: #3b2d35; color: #f38ba8;"
+                " border: 1px solid #f38ba8; border-radius: 6px;"
+                " padding: 8px 12px; font-weight: bold;"
+                "}"
+            )
+            root.addWidget(banner)
 
         # Settings group
         settings = QGroupBox("Параметры сканирования")
         form = QFormLayout(settings)
         form.setLabelAlignment(Qt.AlignRight)
 
-        self.target_edit = QLineEdit(detect_local_subnet())
+        self.target_edit = QLineEdit(default_target)
         self.target_edit.setPlaceholderText("например, 192.168.1.0/24 или 192.168.1.1-50")
-        detect_btn = QPushButton("Авто")
-        detect_btn.setToolTip("Определить локальную подсеть автоматически")
-        detect_btn.clicked.connect(
-            lambda: self.target_edit.setText(detect_local_subnet())
-        )
         target_row = QHBoxLayout()
         target_row.addWidget(self.target_edit, 1)
-        target_row.addWidget(detect_btn)
+        if show_auto_detect:
+            detect_btn = QPushButton("Авто")
+            detect_btn.setToolTip("Определить локальную подсеть автоматически")
+            detect_btn.clicked.connect(
+                lambda: self.target_edit.setText(detect_local_subnet())
+            )
+            target_row.addWidget(detect_btn)
         form.addRow("Цель:", self._wrap(target_row))
 
         self.ping_timeout = QSpinBox()
@@ -356,10 +479,12 @@ class MainWindow(QMainWindow):
         self.btn_scan = QPushButton(" Сканировать")
         self.btn_scan.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.btn_scan.clicked.connect(self.start_scan)
+        self.btn_scan.setObjectName("scan")
         self.btn_stop = QPushButton(" Остановить")
         self.btn_stop.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_scan)
+        self.btn_stop.setObjectName("stop")
         self.btn_clear = QPushButton(" Очистить")
         self.btn_clear.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
         self.btn_clear.clicked.connect(self.clear_results)
@@ -397,89 +522,27 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setShowGrid(False)
-        # default column widths
         widths = {0: 80, 1: 130, 2: 200, 3: 160, 4: 180, 5: 90}
         for col, w in widths.items():
             self.table.setColumnWidth(col, w)
         root.addWidget(self.table, 1)
 
-        # Status bar with progress
-        sb = QStatusBar()
-        self.setStatusBar(sb)
+        # Per-tab status row
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("Готов к сканированию")
+        status_row.addWidget(self.status_label, 1)
         self.progress_bar = QProgressBar()
         self.progress_bar.setMaximumWidth(260)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setValue(0)
-        self.status_label = QLabel("Готов к сканированию")
-        sb.addWidget(self.status_label, 1)
-        sb.addPermanentWidget(self.progress_bar)
+        status_row.addWidget(self.progress_bar)
+        root.addLayout(status_row)
 
     def _wrap(self, layout) -> QWidget:
         w = QWidget()
         w.setLayout(layout)
         layout.setContentsMargins(0, 0, 0, 0)
         return w
-
-    def _apply_dark_theme(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget { background-color: #1e1e2e; color: #cdd6f4; font-size: 13px; }
-            QGroupBox {
-                border: 1px solid #45475a; border-radius: 6px;
-                margin-top: 10px; padding-top: 10px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin; subcontrol-position: top left;
-                left: 10px; padding: 0 5px; color: #89b4fa;
-            }
-            QLineEdit, QSpinBox, QComboBox {
-                background: #313244; border: 1px solid #45475a;
-                border-radius: 4px; padding: 4px 6px; selection-background-color: #585b70;
-            }
-            QLineEdit:focus, QSpinBox:focus { border: 1px solid #89b4fa; }
-            QPushButton {
-                background: #45475a; color: #cdd6f4; border: none;
-                padding: 6px 12px; border-radius: 4px;
-            }
-            QPushButton:hover { background: #585b70; }
-            QPushButton:pressed { background: #6c7086; }
-            QPushButton:disabled { background: #313244; color: #6c7086; }
-            QPushButton#scan { background: #89b4fa; color: #1e1e2e; font-weight: bold; }
-            QPushButton#scan:hover { background: #b4befe; }
-            QPushButton#stop { background: #f38ba8; color: #1e1e2e; }
-            QPushButton#stop:hover { background: #eba0ac; }
-            QTableView {
-                background: #181825; alternate-background-color: #1e1e2e;
-                gridline-color: #313244; selection-background-color: #585b70;
-                selection-color: #cdd6f4; border: 1px solid #313244; border-radius: 4px;
-            }
-            QHeaderView::section {
-                background: #313244; color: #89b4fa; padding: 6px;
-                border: none; border-right: 1px solid #45475a; font-weight: bold;
-            }
-            QStatusBar { background: #181825; color: #cdd6f4; }
-            QProgressBar {
-                background: #313244; border: 1px solid #45475a;
-                border-radius: 3px; text-align: center; height: 16px;
-            }
-            QProgressBar::chunk { background: #a6e3a1; border-radius: 2px; }
-            QCheckBox { spacing: 6px; }
-            QCheckBox::indicator { width: 14px; height: 14px; }
-            QCheckBox::indicator:unchecked {
-                border: 1px solid #6c7086; background: #313244; border-radius: 3px;
-            }
-            QCheckBox::indicator:checked {
-                border: 1px solid #89b4fa; background: #89b4fa; border-radius: 3px;
-            }
-            QToolTip { background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
-            """
-        )
-        self.btn_scan.setObjectName("scan")
-        self.btn_stop.setObjectName("stop")
-        self.btn_scan.style().unpolish(self.btn_scan)
-        self.btn_scan.style().polish(self.btn_scan)
-        self.btn_stop.style().unpolish(self.btn_stop)
-        self.btn_stop.style().polish(self.btn_stop)
 
     # ---------- Scan control ----------
     def _parse_ports(self, text: str) -> list[int]:
@@ -634,13 +697,327 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "Готово", f"Сохранено {len(hosts)} записей:\n{path}")
 
-    # ---------- Lifecycle ----------
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def shutdown(self) -> None:
         if self._worker:
             self._worker.cancel()
         if self._thread and self._thread.isRunning():
             self._thread.quit()
             self._thread.wait(2000)
+
+
+class WifiTab(QWidget):
+    """Tab showing current Wi-Fi connection and router information."""
+
+    REFRESH_MS = 2000
+
+    refreshed = Signal(dict, str, str, str)  # info, gateway_ip, gateway_mac, gateway_vendor
+
+    def __init__(
+        self,
+        local_model: HostsModel | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._local_model = local_model
+        self._build_ui()
+        self.refreshed.connect(self._apply_refresh)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(self.REFRESH_MS)
+        QTimer.singleShot(0, self._refresh)
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        mono = QFont("Consolas")
+
+        # ---- Wi-Fi connection info ----
+        wifi_box = QGroupBox("Текущее Wi-Fi подключение")
+        wifi_form = QFormLayout(wifi_box)
+        wifi_form.setLabelAlignment(Qt.AlignRight)
+        self.lbl_iface = QLabel("—")
+        self.lbl_state = QLabel("—")
+        self.lbl_ssid = QLabel("—")
+        self.lbl_bssid = QLabel("—")
+        self.lbl_signal = QLabel("—")
+        self.lbl_channel = QLabel("—")
+        self.lbl_radio = QLabel("—")
+        self.lbl_auth = QLabel("—")
+        self.lbl_speed = QLabel("—")
+        for lbl in (self.lbl_ssid, self.lbl_bssid):
+            lbl.setFont(mono)
+        wifi_form.addRow("Интерфейс:", self.lbl_iface)
+        wifi_form.addRow("Состояние:", self.lbl_state)
+        wifi_form.addRow("SSID:", self.lbl_ssid)
+        wifi_form.addRow("BSSID:", self.lbl_bssid)
+        wifi_form.addRow("Сигнал:", self.lbl_signal)
+        wifi_form.addRow("Канал:", self.lbl_channel)
+        wifi_form.addRow("Тип радио:", self.lbl_radio)
+        wifi_form.addRow("Безопасность:", self.lbl_auth)
+        wifi_form.addRow("Скорость канала:", self.lbl_speed)
+        root.addWidget(wifi_box)
+
+        # ---- Router info ----
+        router_box = QGroupBox("Роутер")
+        router_form = QFormLayout(router_box)
+        router_form.setLabelAlignment(Qt.AlignRight)
+        self.lbl_gw_ip = QLabel("—")
+        self.lbl_gw_mac = QLabel("—")
+        self.lbl_gw_vendor = QLabel("—")
+        self.lbl_clients = QLabel("—")
+        self.lbl_gw_ip.setFont(mono)
+        self.lbl_gw_mac.setFont(mono)
+        self.btn_admin = QPushButton("Открыть админку в браузере")
+        self.btn_admin.clicked.connect(self._open_admin)
+        self.btn_admin.setEnabled(False)
+        router_form.addRow("IP-адрес:", self.lbl_gw_ip)
+        router_form.addRow("MAC-адрес:", self.lbl_gw_mac)
+        router_form.addRow("Производитель:", self.lbl_gw_vendor)
+        router_form.addRow("Клиентов в сети:", self.lbl_clients)
+        router_form.addRow("", self.btn_admin)
+        root.addWidget(router_box)
+
+        # ---- Graphs ----
+        graphs_box = QGroupBox("Графики (обновление каждые 2 с)")
+        graphs_layout = QHBoxLayout(graphs_box)
+        self.signal_graph = SparklineWidget(title="Сигнал", unit="%", color="#a6e3a1")
+        self.rx_graph = SparklineWidget(title="Приём", unit="Мбит/с", color="#89b4fa")
+        self.tx_graph = SparklineWidget(title="Передача", unit="Мбит/с", color="#fab387")
+        graphs_layout.addWidget(self.signal_graph, 1)
+        graphs_layout.addWidget(self.rx_graph, 1)
+        graphs_layout.addWidget(self.tx_graph, 1)
+        root.addWidget(graphs_box, 1)
+
+    def _refresh(self) -> None:
+        # Run blocking IO (netsh, ipconfig, ping, ARP) in a background thread
+        # so the UI stays responsive; results come back via the `refreshed`
+        # Qt signal, which is processed in the main thread.
+        threading.Thread(target=self._do_refresh_bg, daemon=True).start()
+
+    def _do_refresh_bg(self) -> None:
+        try:
+            info = get_wifi_info()
+        except Exception:  # noqa: BLE001
+            info = {}
+        try:
+            gw = get_default_gateway()
+        except Exception:  # noqa: BLE001
+            gw = ""
+        mac = ""
+        vendor = ""
+        if gw:
+            try:
+                ping(gw, timeout_ms=500)
+                arp = _parse_arp_table()
+                mac = arp.get(gw, "")
+                if mac:
+                    vendor = lookup_vendor(mac)
+            except Exception:  # noqa: BLE001
+                pass
+        self.refreshed.emit(info, gw, mac, vendor)
+
+    def _apply_refresh(
+        self, info: dict, gw: str, mac: str, vendor: str,
+    ) -> None:
+        def pick(*keys: str) -> str:
+            for k in keys:
+                if k in info and info[k]:
+                    return info[k]
+            return ""
+
+        name = pick("Name", "Имя")
+        state = pick("State", "Состояние")
+        ssid = pick("SSID")
+        bssid = pick("BSSID")
+        signal = pick("Signal", "Сигнал")
+        channel = pick("Channel", "Канал")
+        radio = pick("Radio type", "Тип радио")
+        auth = pick("Authentication", "Проверка подлинности")
+        rx = pick(
+            "Receive rate (Mbps)",
+            "Скорость приема (Мбит/с)",
+            "Скорость приёма (Мбит/с)",
+        )
+        tx = pick("Transmit rate (Mbps)", "Скорость передачи (Мбит/с)")
+
+        if not info:
+            self.lbl_iface.setText("Беспроводной интерфейс не обнаружен")
+            self.lbl_state.setText("—")
+            connected = False
+        else:
+            self.lbl_iface.setText(name or "—")
+            self.lbl_state.setText(state or "—")
+            connected = bool(ssid) or state.lower().startswith(("connected", "подкл"))
+
+        if connected:
+            self.lbl_ssid.setText(ssid or "—")
+            self.lbl_bssid.setText(bssid.upper() if bssid else "—")
+            self.lbl_signal.setText(signal or "—")
+            self.lbl_channel.setText(channel or "—")
+            self.lbl_radio.setText(radio or "—")
+            self.lbl_auth.setText(auth or "—")
+            speed_parts = []
+            if rx:
+                speed_parts.append(f"RX {rx} Мбит/с")
+            if tx:
+                speed_parts.append(f"TX {tx} Мбит/с")
+            self.lbl_speed.setText(" · ".join(speed_parts) if speed_parts else "—")
+        else:
+            placeholder = "—"
+            for lbl in (
+                self.lbl_ssid, self.lbl_bssid, self.lbl_signal,
+                self.lbl_channel, self.lbl_radio, self.lbl_auth, self.lbl_speed,
+            ):
+                lbl.setText(placeholder)
+
+        # Router info
+        self.lbl_gw_ip.setText(gw or "—")
+        self.btn_admin.setEnabled(bool(gw))
+        self.lbl_gw_mac.setText(mac.upper() if mac else "—")
+        self.lbl_gw_vendor.setText(vendor or "—")
+
+        # Clients count from local scan tab
+        if self._local_model is not None:
+            alive = len(self._local_model.alive_hosts())
+            self.lbl_clients.setText(f"{alive}")
+        else:
+            self.lbl_clients.setText("—")
+
+        # Update graphs.
+        if signal:
+            try:
+                digits = re.sub(r"[^\d]", "", signal)
+                if digits:
+                    self.signal_graph.add_value(int(digits))
+            except ValueError:
+                pass
+        if rx:
+            try:
+                self.rx_graph.add_value(float(rx))
+            except ValueError:
+                pass
+        if tx:
+            try:
+                self.tx_graph.add_value(float(tx))
+            except ValueError:
+                pass
+
+    def _open_admin(self) -> None:
+        ip = self.lbl_gw_ip.text().strip()
+        if not ip or ip == "—":
+            return
+        QDesktopServices.openUrl(QUrl(f"http://{ip}"))
+
+    def shutdown(self) -> None:
+        self._timer.stop()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("IPbrowse — Сканер локальной сети")
+        self.resize(1200, 760)
+
+        self.tabs = QTabWidget(self)
+        self.setCentralWidget(self.tabs)
+
+        self.local_tab = ScanTab(
+            default_target=detect_local_subnet(),
+            show_auto_detect=True,
+            auto_start=True,
+        )
+        self.external_tab = ScanTab(
+            default_target="",
+            show_auto_detect=False,
+            auto_start=False,
+            warning_text=(
+                "⚠ Сканирование внешних сетей может нарушать правила провайдера и "
+                "действующее законодательство. Сканируйте только те ресурсы, "
+                "на которые у вас есть явное разрешение."
+            ),
+        )
+        self.wifi_tab = WifiTab(local_model=self.local_tab.model)
+
+        self.tabs.addTab(self.local_tab, "Локальная сеть")
+        self.tabs.addTab(self.external_tab, "Внешние сети")
+        self.tabs.addTab(self.wifi_tab, "Wi-Fi")
+
+        self._apply_dark_theme()
+
+    def _apply_dark_theme(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget { background-color: #1e1e2e; color: #cdd6f4; font-size: 13px; }
+            QGroupBox {
+                border: 1px solid #45475a; border-radius: 6px;
+                margin-top: 10px; padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; subcontrol-position: top left;
+                left: 10px; padding: 0 5px; color: #89b4fa;
+            }
+            QLineEdit, QSpinBox, QComboBox {
+                background: #313244; border: 1px solid #45475a;
+                border-radius: 4px; padding: 4px 6px; selection-background-color: #585b70;
+            }
+            QLineEdit:focus, QSpinBox:focus { border: 1px solid #89b4fa; }
+            QPushButton {
+                background: #45475a; color: #cdd6f4; border: none;
+                padding: 6px 12px; border-radius: 4px;
+            }
+            QPushButton:hover { background: #585b70; }
+            QPushButton:pressed { background: #6c7086; }
+            QPushButton:disabled { background: #313244; color: #6c7086; }
+            QPushButton#scan { background: #89b4fa; color: #1e1e2e; font-weight: bold; }
+            QPushButton#scan:hover { background: #b4befe; }
+            QPushButton#stop { background: #f38ba8; color: #1e1e2e; }
+            QPushButton#stop:hover { background: #eba0ac; }
+            QTableView {
+                background: #181825; alternate-background-color: #1e1e2e;
+                gridline-color: #313244; selection-background-color: #585b70;
+                selection-color: #cdd6f4; border: 1px solid #313244; border-radius: 4px;
+            }
+            QHeaderView::section {
+                background: #313244; color: #89b4fa; padding: 6px;
+                border: none; border-right: 1px solid #45475a; font-weight: bold;
+            }
+            QStatusBar { background: #181825; color: #cdd6f4; }
+            QProgressBar {
+                background: #313244; border: 1px solid #45475a;
+                border-radius: 3px; text-align: center; height: 16px;
+            }
+            QProgressBar::chunk { background: #a6e3a1; border-radius: 2px; }
+            QCheckBox { spacing: 6px; }
+            QCheckBox::indicator { width: 14px; height: 14px; }
+            QCheckBox::indicator:unchecked {
+                border: 1px solid #6c7086; background: #313244; border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                border: 1px solid #89b4fa; background: #89b4fa; border-radius: 3px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #313244; border-radius: 4px; background: #1e1e2e;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: #313244; color: #cdd6f4;
+                padding: 8px 18px; border-top-left-radius: 6px;
+                border-top-right-radius: 6px; margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background: #89b4fa; color: #1e1e2e; font-weight: bold;
+            }
+            QTabBar::tab:hover:!selected { background: #45475a; }
+            QToolTip { background: #313244; color: #cdd6f4; border: 1px solid #45475a; }
+            """
+        )
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.local_tab.shutdown()
+        self.external_tab.shutdown()
+        self.wifi_tab.shutdown()
         super().closeEvent(event)
 
 
@@ -649,8 +1026,6 @@ def main() -> int:
     app.setApplicationName("IPbrowse")
     window = MainWindow()
     window.show()
-    # Auto-start a full scan (all ports) right after the UI becomes visible.
-    QTimer.singleShot(0, window.start_scan)
     return app.exec()
 
 

@@ -366,6 +366,55 @@ def detect_local_subnet() -> str:
         return "192.168.1.0/24"
 
 
+def get_default_gateway() -> str:
+    """Return the IPv4 default gateway address or empty string."""
+    if IS_WINDOWS:
+        _, out = _run(["ipconfig"], timeout=5)
+        # English: "Default Gateway . . . . . . . : 192.168.1.1"
+        # Russian: "Основной шлюз . . . . . . . . : 192.168.1.1"
+        for line in out.splitlines():
+            m = re.search(
+                r"(?:Default Gateway|Основной шлюз)[^:]*:\s*"
+                r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+                line,
+            )
+            if m and m.group(1) != "0.0.0.0":
+                return m.group(1)
+        return ""
+    _, out = _run(["ip", "route", "show", "default"], timeout=5)
+    m = re.search(r"default\s+via\s+([0-9.]+)", out)
+    if m:
+        return m.group(1)
+    _, out = _run(["route", "-n"], timeout=5)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "0.0.0.0":
+            return parts[1]
+    return ""
+
+
+def get_wifi_info() -> dict[str, str]:
+    """Return a dict of ``netsh wlan show interfaces`` keys (Windows).
+
+    Returns an empty dict on non-Windows systems or when no Wi-Fi
+    interface is present / connected.
+    """
+    if not IS_WINDOWS:
+        return {}
+    _, out = _run(["netsh", "wlan", "show", "interfaces"], timeout=5)
+    info: dict[str, str] = {}
+    for raw in out.splitlines():
+        line = raw.strip()
+        if not line or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if k and v and not k.startswith("-"):
+            info[k] = v
+    return info
+
+
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else detect_local_subnet()
     print(f"Scanning {target} ...")
