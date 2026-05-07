@@ -2155,6 +2155,11 @@ class MassScanWorker(QObject):
             ]
             total = len(jobs)
             self.progress.emit(0, total)
+            # Throttle progress emission to ~1% increments (or every 50
+            # jobs for tiny scans). Without this, a 65 535-port sweep
+            # floods Qt's queued-connection event loop with progress
+            # signals and starves the GUI thread, freezing the window.
+            progress_step = max(50, total // 100)
 
             pool = ThreadPoolExecutor(
                 max_workers=min(self.workers, max(1, total))
@@ -2173,9 +2178,16 @@ class MassScanWorker(QObject):
                         status, rtt = fut.result()
                     except Exception:  # noqa: BLE001
                         status, rtt = "error", 0.0
-                    self.result.emit(ip, port, status, rtt)
+                    # Only opens are pushed to the GUI — writing every
+                    # closed / timeout / error to a QTreeWidget on a
+                    # 65k-port scan is what froze the window before.
+                    # Closed / timeout / error states are still counted
+                    # via `progress` so the bar / status line stay live.
+                    if status == "open":
+                        self.result.emit(ip, port, status, rtt)
                     done += 1
-                    self.progress.emit(done, total)
+                    if done == total or done % progress_step == 0:
+                        self.progress.emit(done, total)
             finally:
                 # cancel_futures=True drops queued probes; in-flight ones
                 # are bounded by self.timeout, so wait=True is responsive.
@@ -2209,6 +2221,7 @@ class MassScanTab(QWidget):
         self._worker: MassScanWorker | None = None
         self._targets: list[str] = []
         self._results: list[tuple[str, int, str, float]] = []
+        self._needle: str = ""  # cached lower-cased filter for hot-path checks
         self._build_ui()
 
     # ----- UI -----
@@ -2298,13 +2311,15 @@ class MassScanTab(QWidget):
         actions.addSpacing(20)
         actions.addWidget(QLabel("Фильтр:"))
         self.le_filter = QLineEdit()
-        self.le_filter.setPlaceholderText("Только открытые / поиск по IP / …")
-        self.le_filter.textChanged.connect(self._apply_filter)
+        self.le_filter.setPlaceholderText("Поиск по IP / порту…")
+        self.le_filter.textChanged.connect(self._on_filter_changed)
         actions.addWidget(self.le_filter, 1)
 
-        self.cb_only_open = QCheckBox("Только открытые")
-        self.cb_only_open.toggled.connect(self._apply_filter)
-        actions.addWidget(self.cb_only_open)
+        # NOTE: a "Только открытые" checkbox used to live here, but the
+        # worker now only emits result rows for ports it actually
+        # connected to — closed / timeout / error rows are summarised in
+        # progress instead of being pushed to the table. So the checkbox
+        # is implicit (always-on) and was removed.
 
         root.addLayout(actions)
 
@@ -2457,6 +2472,9 @@ class MassScanTab(QWidget):
         self.status_label.setText(
             f"Сканирование {len(self._targets)} адресов × {len(ports)} порт(ов)…"
         )
+        # Disable sorting while results stream in so each insert is O(1)
+        # instead of O(N log N). Sorting is restored in `_on_finished`.
+        self.table.setSortingEnabled(False)
 
         self._thread = QThread(self)
         self._worker = MassScanWorker(
@@ -2484,9 +2502,12 @@ class MassScanTab(QWidget):
     def _on_progress(self, done: int, total: int) -> None:
         self.progress_bar.setMaximum(max(1, total))
         self.progress_bar.setValue(done)
+        # Worker only emits opens, so len(self._results) is the live
+        # open count. Closed / timeout / error states are folded into
+        # the (done - opens) tail.
+        opens = len(self._results)
         self.status_label.setText(
-            f"Просканировано {done}/{total} • открытых: "
-            f"{sum(1 for _,_,s,_ in self._results if s == 'open')}"
+            f"Просканировано {done}/{total} • найдено открытых: {opens}"
         )
 
     _STATUS_COLORS = {
@@ -2499,28 +2520,53 @@ class MassScanTab(QWidget):
     def _on_result(
         self, ip: str, port: int, status: str, rtt: float
     ) -> None:
+        # Defensive — the worker already filters non-opens, but the slot
+        # stays robust if that ever changes.
+        if status != "open":
+            return
         self._results.append((ip, port, status, rtt))
-        item = QTreeWidgetItem([
-            ip, str(port), status, f"{rtt:.1f}",
-        ])
-        # Right-align numeric columns; colour the status cell.
+
+        item = QTreeWidgetItem([ip, str(port), status, f"{rtt:.1f}"])
         item.setTextAlignment(1, Qt.AlignCenter)
         item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
-        item.setForeground(2, QBrush(QColor(self._STATUS_COLORS.get(status, "#cdd6f4"))))
+        item.setForeground(
+            2, QBrush(QColor(self._STATUS_COLORS["open"]))
+        )
         item.setData(0, Qt.UserRole, (ip, port, status, rtt))
+
+        # Hot path: do NOT walk every existing row on insert (used to be
+        # an O(N^2) loop via _apply_filter and was the GUI freeze). Just
+        # apply the cached filter to *this* item.
+        if self._needle and self._needle not in (
+            f"{ip} {port}".lower()
+        ):
+            item.setHidden(True)
+
+        # Auto-scroll to the new row if the user was already viewing the
+        # bottom of the list. If they scrolled up to inspect older
+        # results, the view stays put — they don't get yanked back.
+        bar = self.table.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 4
         self.table.addTopLevelItem(item)
-        self._apply_filter()
+        if at_bottom:
+            self.table.scrollToBottom()
 
     def _on_error(self, message: str) -> None:
         QMessageBox.critical(self, "Ошибка сканирования", message)
 
     def _on_finished(self) -> None:
-        opened = sum(1 for _, _, s, _ in self._results if s == "open")
+        opened = len(self._results)
+        total = self.progress_bar.maximum()
+        done = self.progress_bar.value()
         self.status_label.setText(
-            f"Завершено • всего {len(self._results)} • открытых: {opened}"
+            f"Завершено • просканировано {done}/{total} • открытых: {opened}"
         )
         self.btn_scan.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        # Re-enable sorting now that the storm of inserts is over (we
+        # disabled it in start_scan to avoid an O(N log N) re-sort on
+        # every row added).
+        self.table.setSortingEnabled(True)
         self._thread = None
         self._worker = None
 
@@ -2531,20 +2577,26 @@ class MassScanTab(QWidget):
         self.progress_bar.setValue(0)
         self.status_label.setText("Готов к массовому сканированию")
 
+    def _on_filter_changed(self, text: str) -> None:
+        """Filter input changed — refresh `_needle` and re-evaluate rows."""
+        self._needle = text.strip().lower()
+        self._apply_filter()
+
     def _apply_filter(self) -> None:
-        needle = self.le_filter.text().strip().lower()
-        only_open = self.cb_only_open.isChecked()
+        """Re-apply the cached filter to every existing row.
+
+        Only called when the filter text actually changes (and after a
+        scan ends), NOT on every result. Per-result filtering is done
+        inline in ``_on_result`` against the already-cached needle.
+        """
+        needle = self._needle
         for i in range(self.table.topLevelItemCount()):
             it = self.table.topLevelItem(i)
-            ip, port, status, _rtt = it.data(0, Qt.UserRole)
-            visible = True
-            if only_open and status != "open":
-                visible = False
-            if needle:
-                blob = f"{ip} {port} {status}".lower()
-                if needle not in blob:
-                    visible = False
-            it.setHidden(not visible)
+            if not needle:
+                it.setHidden(False)
+                continue
+            blob = f"{it.text(0)} {it.text(1)}".lower()
+            it.setHidden(needle not in blob)
 
     def export_results(self) -> None:
         if not self._results:
