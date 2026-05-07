@@ -14,3 +14,4 @@ dist/
 *.log
 scan_results_*.csv
 scan_results_*.json
+_out.txt
