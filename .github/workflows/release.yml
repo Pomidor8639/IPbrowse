@@ -1,0 +1,133 @@
+# Builds standalone binaries for Linux, Windows and macOS via PyInstaller
+# whenever a ``v*`` tag is pushed (or this workflow is dispatched
+# manually), and publishes the artefacts as a GitHub Release.
+#
+# PyInstaller doesn't cross-compile, so we run one job per OS via a
+# matrix and rely on GitHub-hosted runners. ``ports.csv`` is bundled
+# explicitly with ``--add-data`` because ``scanner.load_ports_registry``
+# resolves it relative to ``__file__``; without that flag the "Порты"
+# dialog would silently come up empty in the packaged build.
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  # Required by softprops/action-gh-release to create / update Releases.
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      # One bad runner shouldn't kill the other two — release artefacts
+      # for the OSes that did build are still useful.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: IPbrowse-linux-x64
+            pyinstaller_args: --onefile --name IPbrowse --add-data ports.csv:. app.py
+            built_path: dist/IPbrowse
+            needs_zip: false
+          - os: windows-latest
+            artifact_name: IPbrowse-windows-x64.exe
+            # Note the ``;`` separator — Windows uses it instead of ``:``
+            # in PyInstaller --add-data, otherwise PyInstaller treats the
+            # whole argument as a single source path.
+            pyinstaller_args: --windowed --onefile --name IPbrowse --add-data ports.csv;. app.py
+            built_path: dist/IPbrowse.exe
+            needs_zip: false
+          - os: macos-latest
+            artifact_name: IPbrowse-macos-arm64.zip
+            # ``--windowed`` on macOS produces a proper ``.app`` bundle
+            # rather than a bare CLI binary; we zip it below because
+            # GitHub Releases can only host flat files.
+            pyinstaller_args: --windowed --name IPbrowse --add-data ports.csv:. app.py
+            built_path: dist/IPbrowse.app
+            needs_zip: true
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # PySide6 wheels link against libegl/libgl on Linux runners; without
+      # them PyInstaller's import-analysis pass for ``PySide6.QtWidgets``
+      # fails before producing the bundle. Other OSes ship the equivalent
+      # libraries by default.
+      - name: Install Linux Qt deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon0 libxcb-cursor0
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller ${{ matrix.pyinstaller_args }}
+
+      - name: Stage Linux / Windows binary
+        if: matrix.needs_zip == false
+        shell: bash
+        run: |
+          mv "${{ matrix.built_path }}" "${{ matrix.artifact_name }}"
+
+      - name: Zip macOS .app bundle
+        if: matrix.needs_zip == true
+        run: |
+          cd dist
+          # Preserve the .app's internal symlinks (``-y``) so launching
+          # it after unzip still works on the user's Mac.
+          zip -ry "../${{ matrix.artifact_name }}" "$(basename '${{ matrix.built_path }}')"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    # Only create a Release for tag-pushed builds; manual dispatches
+    # still produce downloadable artefacts via the run page, but won't
+    # auto-publish a Release.
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # ``download-artifact`` lays out files as
+      # ``artifacts/<name>/<name>``. Flatten that into a single dir so
+      # the Release upload step sees one file per binary.
+      - name: Flatten artefact tree
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec mv {} release/ \;
+          ls -la release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
