@@ -29,6 +29,7 @@ from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
+    QGuiApplication,
     QIcon,
     QPainter,
     QPen,
@@ -772,11 +773,12 @@ class ScanTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setShowGrid(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        # Right-click → "Копировать IP / MAC / …" context menu, and a quick
-        # double-click anywhere copies the cell's content to the clipboard.
+        # Either left-click or right-click on a row pops up the copy menu
+        # ("Копировать IP / MAC / …"). Ctrl/Shift+click is left alone so
+        # multi-row selection keeps working the regular Qt way.
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_menu)
-        self.table.doubleClicked.connect(self._on_cell_double_clicked)
+        self.table.clicked.connect(self._on_cell_clicked)
         widths = {0: 80, 1: 130, 2: 200, 3: 160, 4: 180, 5: 90}
         for col, w in widths.items():
             self.table.setColumnWidth(col, w)
@@ -838,11 +840,8 @@ class ScanTab(QWidget):
             else:
                 self.status_label.setText("Готов к сканированию")
 
-    def _show_table_menu(self, pos) -> None:
-        proxy_index = self.table.indexAt(pos)
-        host = self._host_at_proxy(proxy_index)
-        if host is None:
-            return
+    def _build_copy_menu(self, host: Host) -> QMenu:
+        """Construct the copy popup for the given Host."""
         menu = QMenu(self)
         if host.ip:
             menu.addAction(
@@ -877,7 +876,34 @@ class ScanTab(QWidget):
             "📋 Копировать строку (TSV)",
             lambda: self._copy_row(host),
         )
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        return menu
+
+    def _show_table_menu(self, pos) -> None:
+        """Right-click handler — show the copy menu at the cursor."""
+        proxy_index = self.table.indexAt(pos)
+        host = self._host_at_proxy(proxy_index)
+        if host is None:
+            return
+        self._build_copy_menu(host).exec(
+            self.table.viewport().mapToGlobal(pos)
+        )
+
+    def _on_cell_clicked(self, proxy_index: QModelIndex) -> None:
+        """Left-click handler — show the copy menu next to the clicked cell.
+
+        Ctrl/Shift+click is left untouched so that the user can still
+        multi-select rows in the regular Qt way.
+        """
+        if QGuiApplication.keyboardModifiers() & (
+            Qt.ControlModifier | Qt.ShiftModifier
+        ):
+            return
+        host = self._host_at_proxy(proxy_index)
+        if host is None:
+            return
+        rect = self.table.visualRect(proxy_index)
+        anchor = self.table.viewport().mapToGlobal(rect.bottomLeft())
+        self._build_copy_menu(host).exec(anchor)
 
     def _copy_row(self, host: Host) -> None:
         parts = [
@@ -889,33 +915,6 @@ class ScanTab(QWidget):
             ",".join(str(p) for p in host.open_ports),
         ]
         self._copy_to_clipboard("\t".join(parts), "вся строка")
-
-    def _on_cell_double_clicked(self, proxy_index: QModelIndex) -> None:
-        # Prefer the underlying Host field (raw IP, raw MAC) over the
-        # display string for ip/mac/hostname/vendor cells; fall back to
-        # the display text for everything else.
-        host = self._host_at_proxy(proxy_index)
-        if host is not None:
-            key = COLUMNS[proxy_index.column()][0]
-            value = ""
-            if key == "ip":
-                value = host.ip
-            elif key == "hostname":
-                value = host.hostname
-            elif key == "mac":
-                value = host.mac.upper() if host.mac else ""
-            elif key == "vendor":
-                value = host.vendor
-            if value:
-                self._copy_to_clipboard(value, value)
-                return
-        text = proxy_index.data(Qt.DisplayRole)
-        if not text or text == "—":
-            return
-        text = str(text)
-        if text.startswith("Сканирование"):
-            return  # progress placeholder, nothing useful to copy
-        self._copy_to_clipboard(text, text)
 
     # ---------- Scan control ----------
     def _parse_ports(self, text: str) -> list[int]:
