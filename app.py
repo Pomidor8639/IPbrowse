@@ -6,9 +6,11 @@ import json
 import os
 import random
 import re
+import socket
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -65,6 +67,8 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableView,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -2030,6 +2034,555 @@ class WifiTab(QWidget):
         self._timer.stop()
 
 
+# Mass-scan speed presets: workers, per-port timeout (seconds), label, danger.
+# "danger=True" pops a confirmation dialog before the scan starts because the
+# combined connection rate can briefly knock out cheap SOHO routers / NAT
+# tables.
+MASS_SPEED_PRESETS: list[tuple[str, int, float, bool, str]] = [
+    ("Медленно",   20,  1.5, False,
+     "20 потоков · таймаут 1.5 с — безопасно, подходит для VPN / мобильных сетей"),
+    ("Нормально", 100,  0.6, False,
+     "100 потоков · таймаут 600 мс — обычная скорость, подходит для домашней сети"),
+    ("Быстро",    300,  0.4, False,
+     "300 потоков · таймаут 400 мс — заметная нагрузка на роутер, но обычно ок"),
+    ("Опасно",    800,  0.2, True,
+     "800 потоков · таймаут 200 мс — ВНИМАНИЕ: может уронить SOHO-роутер / NAT"),
+]
+
+
+def _load_targets_from_file(
+    path: Path,
+) -> tuple[list[str], list[str]]:
+    """Read an IP list from a .txt or .csv file.
+
+    Each line / first CSV column is fed through :func:`expand_target`,
+    so single IPs, ranges (``192.168.1.1-50``), CIDRs (``10.0.0.0/24``)
+    and comma-separated combinations all work. Lines starting with
+    ``#`` and empty lines are skipped.
+
+    Returns ``(targets, errors)`` where ``targets`` is deduplicated in
+    input order and ``errors`` is a list of "<line>: <reason>" strings
+    for entries that couldn't be parsed (so the UI can warn the user
+    without aborting the whole list).
+    """
+    targets: list[str] = []
+    errors: list[str] = []
+
+    def _consume(line: str) -> None:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return
+        try:
+            targets.extend(expand_target(line))
+        except ValueError as exc:
+            errors.append(f"{line!r}: {exc}")
+
+    if path.suffix.lower() == ".csv":
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            for row in reader:
+                if not row:
+                    continue
+                _consume(row[0])
+    else:
+        with path.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                _consume(raw)
+
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for ip in targets:
+        if ip not in seen:
+            seen.add(ip)
+            uniq.append(ip)
+    return uniq, errors
+
+
+class MassScanWorker(QObject):
+    """Parallel single-port TCP-connect scan over a static IP list.
+
+    For each ``(ip, port)`` pair the worker emits one ``result`` signal
+    with the connection state — ``"open"`` / ``"closed"`` / ``"timeout"``
+    / ``"error"`` — and the round-trip time in milliseconds.
+    """
+
+    progress = Signal(int, int)          # done, total
+    result = Signal(str, int, str, float)  # ip, port, status, rtt_ms
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(
+        self,
+        ips: list[str],
+        ports: list[int],
+        workers: int,
+        timeout: float,
+    ) -> None:
+        super().__init__()
+        self.ips = list(ips)
+        self.ports = list(ports)
+        self.workers = max(1, int(workers))
+        self.timeout = float(timeout)
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @staticmethod
+    def _scan(ip: str, port: int, timeout: float) -> tuple[str, float]:
+        """One TCP connect probe; returns (status, rtt_ms)."""
+        import time
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        start = time.perf_counter()
+        try:
+            sock.connect((ip, port))
+        except socket.timeout:
+            return "timeout", timeout * 1000.0
+        except ConnectionRefusedError:
+            return "closed", (time.perf_counter() - start) * 1000.0
+        except OSError:
+            return "error", (time.perf_counter() - start) * 1000.0
+        else:
+            return "open", (time.perf_counter() - start) * 1000.0
+        finally:
+            sock.close()
+
+    def run(self) -> None:
+        try:
+            jobs: list[tuple[str, int]] = [
+                (ip, port) for ip in self.ips for port in self.ports
+            ]
+            total = len(jobs)
+            self.progress.emit(0, total)
+
+            pool = ThreadPoolExecutor(
+                max_workers=min(self.workers, max(1, total))
+            )
+            try:
+                futures = {
+                    pool.submit(self._scan, ip, port, self.timeout): (ip, port)
+                    for ip, port in jobs
+                }
+                done = 0
+                for fut in as_completed(futures):
+                    if self._cancel.is_set():
+                        break
+                    ip, port = futures[fut]
+                    try:
+                        status, rtt = fut.result()
+                    except Exception:  # noqa: BLE001
+                        status, rtt = "error", 0.0
+                    self.result.emit(ip, port, status, rtt)
+                    done += 1
+                    self.progress.emit(done, total)
+            finally:
+                # cancel_futures=True drops queued probes; in-flight ones
+                # are bounded by self.timeout, so wait=True is responsive.
+                pool.shutdown(wait=True, cancel_futures=True)
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class MassScanTab(QWidget):
+    """Tab for scanning a user-supplied list of IPs against a single port.
+
+    The list comes from a .txt / .csv file the user picks; lines may be
+    bare IPs, ranges or CIDRs (delegated to ``expand_target``). The
+    speed combo-box trades off worker count against socket timeout —
+    the "Опасно" preset shows a confirmation dialog before starting
+    because high connection rates can briefly knock out SOHO routers.
+    """
+
+    _COLUMNS = [
+        ("ip",       "IP-адрес"),
+        ("port",     "Порт"),
+        ("status",   "Статус"),
+        ("rtt",      "Отклик (мс)"),
+    ]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._thread: QThread | None = None
+        self._worker: MassScanWorker | None = None
+        self._targets: list[str] = []
+        self._results: list[tuple[str, int, str, float]] = []
+        self._build_ui()
+
+    # ----- UI -----
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Загрузите список IP / диапазонов / подсетей из файла "
+            "(.txt — по одной записи на строку, или .csv — первая колонка). "
+            "Сканирование проверяет один и тот же порт на всех адресах в "
+            "несколько потоков."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #94e2d5; font-style: italic; padding: 4px 0;")
+        root.addWidget(intro)
+
+        # ---- File picker row ----
+        settings = QGroupBox("Параметры массового сканирования")
+        form = QFormLayout(settings)
+        form.setLabelAlignment(Qt.AlignRight)
+
+        file_row = QHBoxLayout()
+        self.le_file = QLineEdit()
+        self.le_file.setPlaceholderText("Путь к файлу с IP (.txt или .csv)")
+        self.le_file.textChanged.connect(self._on_file_changed)
+        file_row.addWidget(self.le_file, 1)
+        btn_browse = QPushButton(" Обзор…")
+        btn_browse.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        btn_browse.clicked.connect(self._pick_file)
+        file_row.addWidget(btn_browse)
+        form.addRow("Файл:", self._wrap(file_row))
+
+        self.lbl_targets = QLabel("Файл не выбран")
+        self.lbl_targets.setStyleSheet("color: #6c7086; font-style: italic;")
+        form.addRow("", self.lbl_targets)
+
+        # ---- Port + speed row ----
+        ps_row = QHBoxLayout()
+        self.le_port = QLineEdit("22")
+        self.le_port.setPlaceholderText("например, 22 или 22,80,443")
+        self.le_port.setMaximumWidth(180)
+        ps_row.addWidget(QLabel("Порт:"))
+        ps_row.addWidget(self.le_port)
+        ps_row.addSpacing(20)
+        ps_row.addWidget(QLabel("Скорость:"))
+        self.cmb_speed = QComboBox()
+        for label, workers, timeout, danger, desc in MASS_SPEED_PRESETS:
+            self.cmb_speed.addItem(label, (workers, timeout, danger, desc))
+        self.cmb_speed.setCurrentIndex(1)  # Нормально
+        self.cmb_speed.currentIndexChanged.connect(self._update_speed_hint)
+        ps_row.addWidget(self.cmb_speed)
+        ps_row.addStretch(1)
+        form.addRow("", self._wrap(ps_row))
+
+        self.lbl_speed_hint = QLabel("")
+        self.lbl_speed_hint.setWordWrap(True)
+        form.addRow("", self.lbl_speed_hint)
+        self._update_speed_hint()
+
+        root.addWidget(settings)
+
+        # ---- Action row ----
+        actions = QHBoxLayout()
+        self.btn_scan = QPushButton(" Сканировать")
+        self.btn_scan.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.btn_scan.setObjectName("scan")
+        self.btn_scan.clicked.connect(self.start_scan)
+        actions.addWidget(self.btn_scan)
+
+        self.btn_stop = QPushButton(" Остановить")
+        self.btn_stop.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
+        self.btn_stop.setObjectName("stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_scan)
+        actions.addWidget(self.btn_stop)
+
+        self.btn_clear = QPushButton(" Очистить")
+        self.btn_clear.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        self.btn_clear.clicked.connect(self.clear_results)
+        actions.addWidget(self.btn_clear)
+
+        self.btn_export = QPushButton(" Экспорт")
+        self.btn_export.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.btn_export.clicked.connect(self.export_results)
+        actions.addWidget(self.btn_export)
+
+        actions.addSpacing(20)
+        actions.addWidget(QLabel("Фильтр:"))
+        self.le_filter = QLineEdit()
+        self.le_filter.setPlaceholderText("Только открытые / поиск по IP / …")
+        self.le_filter.textChanged.connect(self._apply_filter)
+        actions.addWidget(self.le_filter, 1)
+
+        self.cb_only_open = QCheckBox("Только открытые")
+        self.cb_only_open.toggled.connect(self._apply_filter)
+        actions.addWidget(self.cb_only_open)
+
+        root.addLayout(actions)
+
+        # ---- Results table ----
+        self.table = QTreeWidget()
+        self.table.setColumnCount(len(self._COLUMNS))
+        self.table.setHeaderLabels([c[1] for c in self._COLUMNS])
+        self.table.setRootIsDecorated(False)
+        self.table.setUniformRowHeights(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setSortingEnabled(True)
+        for i, w in enumerate((180, 80, 120, 120)):
+            self.table.setColumnWidth(i, w)
+        root.addWidget(self.table, 1)
+
+        # ---- Status row ----
+        status_row = QHBoxLayout()
+        self.status_label = QLabel("Готов к массовому сканированию")
+        status_row.addWidget(self.status_label, 1)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(260)
+        self.progress_bar.setValue(0)
+        status_row.addWidget(self.progress_bar)
+        root.addLayout(status_row)
+
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        w.setLayout(layout)
+        layout.setContentsMargins(0, 0, 0, 0)
+        return w
+
+    # ----- Speed / file handlers -----
+    def _update_speed_hint(self) -> None:
+        data = self.cmb_speed.currentData()
+        if not data:
+            return
+        workers, timeout, danger, desc = data
+        color = "#f38ba8" if danger else "#94e2d5"
+        prefix = "ВНИМАНИЕ:  " if danger else ""
+        self.lbl_speed_hint.setStyleSheet(f"color: {color};")
+        self.lbl_speed_hint.setText(f"{prefix}{desc}")
+
+    def _pick_file(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбрать файл со списком IP",
+            "",
+            "Список адресов (*.txt *.csv);;Текст (*.txt);;CSV (*.csv);;Все файлы (*.*)",
+        )
+        if path_str:
+            self.le_file.setText(path_str)
+
+    def _on_file_changed(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            self._targets = []
+            self.lbl_targets.setText("Файл не выбран")
+            self.lbl_targets.setStyleSheet("color: #6c7086; font-style: italic;")
+            return
+        path = Path(text)
+        if not path.is_file():
+            self._targets = []
+            self.lbl_targets.setText("Файл не найден")
+            self.lbl_targets.setStyleSheet("color: #f38ba8;")
+            return
+        try:
+            targets, errors = _load_targets_from_file(path)
+        except OSError as exc:
+            self._targets = []
+            self.lbl_targets.setText(f"Не удалось прочитать файл: {exc}")
+            self.lbl_targets.setStyleSheet("color: #f38ba8;")
+            return
+        self._targets = targets
+        if not targets:
+            self.lbl_targets.setText("Файл не содержит валидных адресов")
+            self.lbl_targets.setStyleSheet("color: #f9e2af;")
+            return
+        msg = f"Загружено адресов: {len(targets)}"
+        if errors:
+            msg += f" · пропущено строк с ошибками: {len(errors)}"
+        self.lbl_targets.setText(msg)
+        self.lbl_targets.setStyleSheet(
+            "color: #f9e2af;" if errors else "color: #a6e3a1;"
+        )
+
+    # ----- Scan control -----
+    def _parse_ports(self, text: str) -> list[int]:
+        ports: set[int] = set()
+        for chunk in text.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "-" in chunk:
+                a, b = chunk.split("-", 1)
+                ports.update(range(int(a), int(b) + 1))
+            else:
+                ports.add(int(chunk))
+        return sorted(p for p in ports if 1 <= p <= 65535)
+
+    def start_scan(self) -> None:
+        if not self._targets:
+            QMessageBox.warning(
+                self, "Нет адресов",
+                "Выберите файл со списком IP-адресов.",
+            )
+            return
+        try:
+            ports = self._parse_ports(self.le_port.text())
+        except ValueError:
+            QMessageBox.critical(
+                self, "Ошибка", "Некорректный список портов."
+            )
+            return
+        if not ports:
+            QMessageBox.warning(
+                self, "Не указан порт",
+                "Введите порт (например, 22) или список 22,80,443.",
+            )
+            return
+
+        data = self.cmb_speed.currentData()
+        workers, timeout, danger, _desc = data
+
+        if danger:
+            jobs = len(self._targets) * len(ports)
+            ans = QMessageBox.warning(
+                self,
+                "Подтверждение опасной скорости",
+                "Скорость «Опасно» создаёт до "
+                f"{workers} одновременных TCP-соединений и шлёт "
+                f"{jobs} проб с очень коротким таймаутом ({int(timeout * 1000)} мс).\n\n"
+                "На бытовых роутерах и в небольших сетях это может:\n"
+                "  • временно переполнить таблицу NAT;\n"
+                "  • вызвать кратковременную потерю интернета;\n"
+                "  • быть расценено IDS как сетевая атака.\n\n"
+                "Запускать только в сети, которой вы владеете и где "
+                "имеете право проводить такие тесты.\n\n"
+                "Продолжить?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+
+        self.clear_results()
+        self.btn_scan.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.status_label.setText(
+            f"Сканирование {len(self._targets)} адресов × {len(ports)} порт(ов)…"
+        )
+
+        self._thread = QThread(self)
+        self._worker = MassScanWorker(
+            ips=list(self._targets),
+            ports=ports,
+            workers=workers,
+            timeout=timeout,
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.result.connect(self._on_result)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def stop_scan(self) -> None:
+        if self._worker:
+            self._worker.cancel()
+            self.status_label.setText("Останавливаю сканирование…")
+
+    def _on_progress(self, done: int, total: int) -> None:
+        self.progress_bar.setMaximum(max(1, total))
+        self.progress_bar.setValue(done)
+        self.status_label.setText(
+            f"Просканировано {done}/{total} • открытых: "
+            f"{sum(1 for _,_,s,_ in self._results if s == 'open')}"
+        )
+
+    _STATUS_COLORS = {
+        "open":    "#a6e3a1",
+        "closed":  "#f9e2af",
+        "timeout": "#fab387",
+        "error":   "#f38ba8",
+    }
+
+    def _on_result(
+        self, ip: str, port: int, status: str, rtt: float
+    ) -> None:
+        self._results.append((ip, port, status, rtt))
+        item = QTreeWidgetItem([
+            ip, str(port), status, f"{rtt:.1f}",
+        ])
+        # Right-align numeric columns; colour the status cell.
+        item.setTextAlignment(1, Qt.AlignCenter)
+        item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
+        item.setForeground(2, QBrush(QColor(self._STATUS_COLORS.get(status, "#cdd6f4"))))
+        item.setData(0, Qt.UserRole, (ip, port, status, rtt))
+        self.table.addTopLevelItem(item)
+        self._apply_filter()
+
+    def _on_error(self, message: str) -> None:
+        QMessageBox.critical(self, "Ошибка сканирования", message)
+
+    def _on_finished(self) -> None:
+        opened = sum(1 for _, _, s, _ in self._results if s == "open")
+        self.status_label.setText(
+            f"Завершено • всего {len(self._results)} • открытых: {opened}"
+        )
+        self.btn_scan.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._thread = None
+        self._worker = None
+
+    # ----- Results -----
+    def clear_results(self) -> None:
+        self._results.clear()
+        self.table.clear()
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Готов к массовому сканированию")
+
+    def _apply_filter(self) -> None:
+        needle = self.le_filter.text().strip().lower()
+        only_open = self.cb_only_open.isChecked()
+        for i in range(self.table.topLevelItemCount()):
+            it = self.table.topLevelItem(i)
+            ip, port, status, _rtt = it.data(0, Qt.UserRole)
+            visible = True
+            if only_open and status != "open":
+                visible = False
+            if needle:
+                blob = f"{ip} {port} {status}".lower()
+                if needle not in blob:
+                    visible = False
+            it.setHidden(not visible)
+
+    def export_results(self) -> None:
+        if not self._results:
+            QMessageBox.information(
+                self, "Нет данных", "Сначала запустите сканирование."
+            )
+            return
+        default = f"mass_scan_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Экспорт результатов", default,
+            "CSV (*.csv);;Текст (*.txt);;Все файлы (*.*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        try:
+            with path.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["ip", "port", "status", "rtt_ms"])
+                for ip, port, status, rtt in self._results:
+                    writer.writerow([ip, port, status, f"{rtt:.1f}"])
+        except OSError as exc:
+            QMessageBox.critical(
+                self, "Ошибка", f"Не удалось сохранить файл:\n{exc}"
+            )
+            return
+        QMessageBox.information(
+            self, "Готово", f"Сохранено {len(self._results)} строк:\n{path}"
+        )
+
+    def shutdown(self) -> None:
+        if self._worker:
+            self._worker.cancel()
+        if self._thread and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(2000)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2055,10 +2608,12 @@ class MainWindow(QMainWindow):
             ),
         )
         self.wifi_tab = WifiTab(local_model=self.local_tab.model)
+        self.mass_tab = MassScanTab()
 
         self.tabs.addTab(self.local_tab, "Локальная сеть")
         self.tabs.addTab(self.external_tab, "Внешние сети")
         self.tabs.addTab(self.wifi_tab, "Wi-Fi")
+        self.tabs.addTab(self.mass_tab, "Массовое сканирование")
 
         self._apply_dark_theme()
 
@@ -2152,6 +2707,7 @@ class MainWindow(QMainWindow):
         self.local_tab.shutdown()
         self.external_tab.shutdown()
         self.wifi_tab.shutdown()
+        self.mass_tab.shutdown()
         super().closeEvent(event)
 
 
