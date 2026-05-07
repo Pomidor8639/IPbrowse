@@ -66,6 +66,22 @@ COMMON_PORTS: dict[int, str] = {
 }
 
 
+# Top 100 most-frequently-open TCP ports across the public internet
+# (derived from nmap-services statistics). Used by the ``--top-ports``
+# flag in the GUI to provide quick reduced-port-set scans.
+TOP_PORTS: tuple[int, ...] = (
+    7, 9, 13, 21, 22, 23, 25, 26, 37, 53, 79, 80, 81, 88, 106, 110,
+    111, 113, 119, 135, 139, 143, 144, 179, 199, 389, 427, 443, 444,
+    445, 465, 513, 514, 515, 543, 544, 548, 554, 587, 631, 646, 873,
+    990, 993, 995, 1025, 1026, 1027, 1028, 1029, 1110, 1433, 1720,
+    1723, 1755, 1900, 2000, 2001, 2049, 2121, 2717, 3000, 3128, 3306,
+    3389, 3986, 4899, 5000, 5009, 5051, 5060, 5101, 5190, 5357, 5432,
+    5631, 5666, 5800, 5900, 6000, 6001, 6646, 7070, 8000, 8008, 8009,
+    8080, 8081, 8443, 8888, 9100, 9999, 10000, 32768, 49152, 49153,
+    49154, 49155, 49156, 49157,
+)
+
+
 @dataclass
 class Host:
     ip: str
@@ -268,6 +284,8 @@ def scan_network(
     cancel_event=None,
     on_host_update: Callable[[Host], None] | None = None,
     port_progress_cb: Callable[[str, int, int], None] | None = None,
+    skip_ping: bool = False,
+    ping_retries: int = 1,
 ) -> Iterator[Host]:
     """Yield Host objects as they are discovered.
 
@@ -283,15 +301,34 @@ def scan_network(
     ports = list(ports or [])
     total_ports = len(ports)
 
-    # Phase 1: ping sweep in parallel
+    # Phase 1: ping sweep in parallel (skipped if --skip_ping was requested,
+    # in which case every target is treated as alive and forwarded to phase 2).
     def _check(ip: str) -> Host:
-        alive, rtt = ping(ip, timeout_ms=ping_timeout_ms)
+        if skip_ping:
+            return Host(
+                ip=ip,
+                alive=True,
+                response_ms=None,
+                port_scan_total=total_ports,
+                scan_complete=False,
+            )
+        attempts = max(1, ping_retries)
+        for _ in range(attempts):
+            alive, rtt = ping(ip, timeout_ms=ping_timeout_ms)
+            if alive:
+                return Host(
+                    ip=ip,
+                    alive=True,
+                    response_ms=rtt,
+                    port_scan_total=total_ports,
+                    scan_complete=False,
+                )
         return Host(
             ip=ip,
-            alive=alive,
-            response_ms=rtt,
+            alive=False,
+            response_ms=None,
             port_scan_total=total_ports,
-            scan_complete=not alive,
+            scan_complete=True,
         )
 
     alive_hosts: list[Host] = []

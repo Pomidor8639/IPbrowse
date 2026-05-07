@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import csv
 import json
+import random
 import re
 import sys
 import threading
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -37,8 +39,10 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -63,6 +67,7 @@ from PySide6.QtWidgets import (
 from scanner import (
     COMMON_PORTS,
     Host,
+    TOP_PORTS,
     _parse_arp_table,
     detect_local_subnet,
     expand_target,
@@ -83,6 +88,218 @@ COLUMNS = [
     ("response_ms", "Отклик (мс)"),
     ("open_ports", "Открытые порты"),
 ]
+
+
+# Timing templates: nmap-style presets that override the manual ping-timeout
+# and worker-count spin-boxes when the corresponding -T<N> flag is selected.
+# Format: { id: (short_name, ru_description, ping_timeout_ms, workers) }
+TIMING_TEMPLATES: dict[int, tuple[str, str, int, int]] = {
+    0: ("Paranoid", "очень медленно, для скрытных сканов", 5000, 1),
+    1: ("Sneaky", "медленно", 3000, 10),
+    2: ("Polite", "мягкий темп", 1500, 30),
+    3: ("Normal", "обычная скорость (по умолчанию)", 700, 100),
+    4: ("Aggressive", "быстро", 300, 200),
+    5: ("Insane", "максимальная скорость", 150, 400),
+}
+
+
+@dataclass
+class ScanFlags:
+    """Optional scan flags configurable per tab via the FlagsDialog."""
+
+    skip_ping: bool = False                 # -Pn
+    timing: int = 3                         # -T<N>; 3 = no override
+    top_ports: int = 0                      # --top-ports N; 0 = disabled
+    randomize_ports: bool = False           # --randomize-ports
+    retries: int = 1                        # --retry N; 1 = no extra retries
+    exclude_text: str = ""                  # --exclude IPs / ranges
+
+    def is_default(self) -> bool:
+        return self == ScanFlags()
+
+    def to_summary(self) -> str:
+        """Human-readable summary like ``-Pn -T4 --top-ports 100``."""
+        parts: list[str] = []
+        if self.skip_ping:
+            parts.append("-Pn")
+        if self.timing != 3:
+            parts.append(f"-T{self.timing}")
+        if self.top_ports:
+            parts.append(f"--top-ports {self.top_ports}")
+        if self.randomize_ports:
+            parts.append("--randomize-ports")
+        if self.retries > 1:
+            parts.append(f"--retry {self.retries}")
+        if self.exclude_text.strip():
+            parts.append(f"--exclude {self.exclude_text.strip()}")
+        return " ".join(parts)
+
+
+class FlagsDialog(QDialog):
+    """Modal dialog that lets the user toggle additional scan flags."""
+
+    _FLAG_STYLE = (
+        "color: #89b4fa; font-family: Consolas, monospace; "
+        "font-weight: bold;"
+    )
+
+    def __init__(self, current: ScanFlags, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Флаги сканирования")
+        self.setModal(True)
+        self.resize(620, 480)
+        self._build_ui()
+        self._apply_to_ui(current)
+
+    # ----- UI construction -----
+    def _flag_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(self._FLAG_STYLE)
+        lbl.setMinimumWidth(150)
+        return lbl
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        info = QLabel(
+            "Дополнительные параметры сканирования. Применяются поверх "
+            "значений из основной панели вкладки."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #94e2d5; font-style: italic;")
+        root.addWidget(info)
+
+        # ---- Host discovery ----
+        host_box = QGroupBox("Обнаружение хостов")
+        host_layout = QVBoxLayout(host_box)
+        host_layout.setSpacing(6)
+
+        self.cb_skip_ping = QCheckBox()
+        skip_row = QHBoxLayout()
+        skip_row.addWidget(self.cb_skip_ping)
+        skip_row.addWidget(self._flag_label("-Pn"))
+        skip_row.addWidget(QLabel(
+            "Пропустить ping (сканировать все адреса как активные)"
+        ), 1)
+        host_layout.addLayout(skip_row)
+
+        self.cb_retries = QCheckBox()
+        retry_row = QHBoxLayout()
+        retry_row.addWidget(self.cb_retries)
+        retry_row.addWidget(self._flag_label("--retry"))
+        retry_row.addWidget(QLabel("Повторов ping при недоступности:"))
+        self.sp_retries = QSpinBox()
+        self.sp_retries.setRange(2, 5)
+        self.sp_retries.setValue(2)
+        retry_row.addWidget(self.sp_retries)
+        retry_row.addStretch(1)
+        host_layout.addLayout(retry_row)
+
+        root.addWidget(host_box)
+
+        # ---- Timing ----
+        timing_box = QGroupBox("Тайминг")
+        timing_layout = QHBoxLayout(timing_box)
+        timing_layout.addWidget(self._flag_label("-T<N>"))
+        timing_layout.addWidget(QLabel("Шаблон скорости:"))
+        self.cmb_timing = QComboBox()
+        for tid, (name, desc, _, _) in TIMING_TEMPLATES.items():
+            self.cmb_timing.addItem(f"T{tid} — {name} ({desc})", tid)
+        self.cmb_timing.setCurrentIndex(3)
+        timing_layout.addWidget(self.cmb_timing, 1)
+        root.addWidget(timing_box)
+
+        # ---- Ports ----
+        ports_box = QGroupBox("Порты")
+        ports_layout = QVBoxLayout(ports_box)
+        ports_layout.setSpacing(6)
+
+        self.cb_top_ports = QCheckBox()
+        top_row = QHBoxLayout()
+        top_row.addWidget(self.cb_top_ports)
+        top_row.addWidget(self._flag_label("--top-ports"))
+        top_row.addWidget(QLabel(
+            "Сканировать только N самых популярных портов:"
+        ))
+        self.sp_top_ports = QSpinBox()
+        self.sp_top_ports.setRange(1, len(TOP_PORTS))
+        self.sp_top_ports.setValue(100)
+        top_row.addWidget(self.sp_top_ports)
+        top_row.addStretch(1)
+        ports_layout.addLayout(top_row)
+
+        self.cb_randomize = QCheckBox()
+        rand_row = QHBoxLayout()
+        rand_row.addWidget(self.cb_randomize)
+        rand_row.addWidget(self._flag_label("--randomize-ports"))
+        rand_row.addWidget(QLabel("Случайный порядок сканирования портов"), 1)
+        ports_layout.addLayout(rand_row)
+
+        root.addWidget(ports_box)
+
+        # ---- Exclusions ----
+        excl_box = QGroupBox("Исключения")
+        excl_layout = QVBoxLayout(excl_box)
+        excl_layout.setSpacing(4)
+        excl_top = QHBoxLayout()
+        excl_top.addWidget(self._flag_label("--exclude"))
+        excl_top.addWidget(QLabel(
+            "Адреса и подсети, которые нужно пропустить:"
+        ), 1)
+        excl_layout.addLayout(excl_top)
+        self.le_exclude = QLineEdit()
+        self.le_exclude.setPlaceholderText(
+            "например, 192.168.1.1, 192.168.1.10-15, 10.0.0.0/24"
+        )
+        excl_layout.addWidget(self.le_exclude)
+        root.addWidget(excl_box)
+
+        root.addStretch(1)
+
+        # ---- Buttons ----
+        btn_row = QHBoxLayout()
+        btn_reset = QPushButton("Сбросить")
+        btn_reset.clicked.connect(self._reset)
+        btn_row.addWidget(btn_reset)
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_ok = QPushButton("Применить")
+        btn_ok.setDefault(True)
+        btn_ok.setObjectName("scan")  # reuse blue accent style
+        btn_ok.clicked.connect(self.accept)
+        btn_row.addWidget(btn_ok)
+        root.addLayout(btn_row)
+
+    # ----- Data binding -----
+    def _apply_to_ui(self, f: ScanFlags) -> None:
+        self.cb_skip_ping.setChecked(f.skip_ping)
+        idx = self.cmb_timing.findData(f.timing)
+        self.cmb_timing.setCurrentIndex(idx if idx >= 0 else 3)
+        self.cb_top_ports.setChecked(f.top_ports > 0)
+        if f.top_ports > 0:
+            self.sp_top_ports.setValue(f.top_ports)
+        self.cb_randomize.setChecked(f.randomize_ports)
+        self.cb_retries.setChecked(f.retries > 1)
+        if f.retries > 1:
+            self.sp_retries.setValue(f.retries)
+        self.le_exclude.setText(f.exclude_text)
+
+    def _reset(self) -> None:
+        self._apply_to_ui(ScanFlags())
+
+    def get_flags(self) -> ScanFlags:
+        return ScanFlags(
+            skip_ping=self.cb_skip_ping.isChecked(),
+            timing=int(self.cmb_timing.currentData()),
+            top_ports=self.sp_top_ports.value() if self.cb_top_ports.isChecked() else 0,
+            randomize_ports=self.cb_randomize.isChecked(),
+            retries=self.sp_retries.value() if self.cb_retries.isChecked() else 1,
+            exclude_text=self.le_exclude.text().strip(),
+        )
 
 
 class HostsModel(QAbstractTableModel):
@@ -238,6 +455,8 @@ class ScanWorker(QObject):
         ports: list[int],
         port_timeout: float,
         port_workers: int = 64,
+        skip_ping: bool = False,
+        ping_retries: int = 1,
     ) -> None:
         super().__init__()
         self.targets = targets
@@ -248,6 +467,8 @@ class ScanWorker(QObject):
         self.ports = ports
         self.port_timeout = port_timeout
         self.port_workers = port_workers
+        self.skip_ping = skip_ping
+        self.ping_retries = ping_retries
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -277,6 +498,8 @@ class ScanWorker(QObject):
                 cancel_event=self._cancel,
                 on_host_update=_on_partial,
                 port_progress_cb=_on_port_progress,
+                skip_ping=self.skip_ping,
+                ping_retries=self.ping_retries,
             ):
                 self.host_found.emit(host)
                 if host.scan_complete:
@@ -395,6 +618,7 @@ class ScanTab(QWidget):
 
         self._thread: QThread | None = None
         self._worker: ScanWorker | None = None
+        self.flags = ScanFlags()
 
         self._build_ui(default_target, show_auto_detect, warning_text)
         if auto_start:
@@ -491,9 +715,15 @@ class ScanTab(QWidget):
         self.btn_clear.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
         self.btn_clear.clicked.connect(self.clear_results)
 
+        self.btn_flags = QPushButton(" Флаги")
+        self.btn_flags.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.btn_flags.setToolTip("Дополнительные флаги: -Pn, -T<N>, --top-ports, --exclude и др.")
+        self.btn_flags.clicked.connect(self._open_flags_dialog)
+
         actions.addWidget(self.btn_scan)
         actions.addWidget(self.btn_stop)
         actions.addWidget(self.btn_clear)
+        actions.addWidget(self.btn_flags)
         actions.addSpacing(15)
 
         actions.addWidget(QLabel("Фильтр:"))
@@ -512,6 +742,15 @@ class ScanTab(QWidget):
         actions.addWidget(self.btn_export)
 
         root.addLayout(actions)
+
+        # Active flags summary (shown only when at least one flag differs
+        # from the defaults).
+        self.lbl_flags = QLabel("")
+        self.lbl_flags.setStyleSheet(
+            "color: #94e2d5; font-style: italic; padding: 2px 4px;"
+        )
+        self.lbl_flags.setVisible(False)
+        root.addWidget(self.lbl_flags)
 
         # Table
         self.table = QTableView()
@@ -546,6 +785,22 @@ class ScanTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         return w
 
+    # ---------- Flags ----------
+    def _open_flags_dialog(self) -> None:
+        dlg = FlagsDialog(self.flags, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.flags = dlg.get_flags()
+            self._update_flags_label()
+
+    def _update_flags_label(self) -> None:
+        summary = self.flags.to_summary()
+        if summary:
+            self.lbl_flags.setText(f"Активные флаги: {summary}")
+            self.lbl_flags.setVisible(True)
+        else:
+            self.lbl_flags.clear()
+            self.lbl_flags.setVisible(False)
+
     # ---------- Scan control ----------
     def _parse_ports(self, text: str) -> list[int]:
         ports: set[int] = set()
@@ -573,6 +828,31 @@ class ScanTab(QWidget):
         if not targets:
             QMessageBox.warning(self, "Цель пуста", "Не удалось получить список адресов для сканирования.")
             return
+
+        f = self.flags
+
+        # --exclude: drop excluded addresses from the targets list.
+        if f.exclude_text.strip():
+            excluded: set[str] = set()
+            for chunk in (c.strip() for c in f.exclude_text.split(",")):
+                if not chunk:
+                    continue
+                try:
+                    excluded.update(expand_target(chunk))
+                except ValueError:
+                    QMessageBox.critical(
+                        self, "Ошибка",
+                        f"Некорректное значение в --exclude: {chunk!r}",
+                    )
+                    return
+            targets = [t for t in targets if t not in excluded]
+            if not targets:
+                QMessageBox.warning(
+                    self, "Цель пуста",
+                    "После применения --exclude не осталось адресов для сканирования.",
+                )
+                return
+
         if len(targets) > 4096:
             ans = QMessageBox.question(
                 self,
@@ -582,13 +862,28 @@ class ScanTab(QWidget):
             if ans != QMessageBox.Yes:
                 return
 
+        # Build the port list. --top-ports overrides the manual ports field;
+        # --randomize-ports shuffles the resulting list.
         ports: list[int] = []
         if self.cb_ports.isChecked():
-            try:
-                ports = self._parse_ports(self.ports_edit.text())
-            except ValueError:
-                QMessageBox.critical(self, "Ошибка", "Некорректный список портов.")
-                return
+            if f.top_ports > 0:
+                ports = list(TOP_PORTS[:f.top_ports])
+            else:
+                try:
+                    ports = self._parse_ports(self.ports_edit.text())
+                except ValueError:
+                    QMessageBox.critical(self, "Ошибка", "Некорректный список портов.")
+                    return
+            if f.randomize_ports:
+                random.shuffle(ports)
+
+        # -T<N>: timing template overrides the manual ping-timeout / workers
+        # spin-boxes when something other than T3 (the default) is selected.
+        if f.timing != 3:
+            _, _, ping_timeout_ms, workers = TIMING_TEMPLATES[f.timing]
+        else:
+            ping_timeout_ms = self.ping_timeout.value()
+            workers = self.workers.value()
 
         self.model.clear()
         self.progress_bar.setValue(0)
@@ -610,13 +905,15 @@ class ScanTab(QWidget):
         self._thread = QThread(self)
         self._worker = ScanWorker(
             targets=targets,
-            ping_timeout_ms=self.ping_timeout.value(),
-            workers=self.workers.value(),
+            ping_timeout_ms=ping_timeout_ms,
+            workers=workers,
             resolve_hostnames=self.cb_hostname.isChecked(),
             detect_mac=self.cb_mac.isChecked(),
             ports=ports,
             port_timeout=port_timeout,
             port_workers=port_workers,
+            skip_ping=f.skip_ping,
+            ping_retries=f.retries,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
