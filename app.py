@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import random
 import re
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field, replace
@@ -47,6 +49,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -69,6 +72,7 @@ from PySide6.QtWidgets import (
 from scanner import (
     COMMON_PORTS,
     Host,
+    IS_WINDOWS,
     TOP_PORTS,
     _parse_arp_table,
     detect_local_subnet,
@@ -109,11 +113,22 @@ TIMING_TEMPLATES: dict[int, tuple[str, str, int, int]] = {
 class ScanFlags:
     """Optional scan flags configurable per tab via the FlagsDialog."""
 
+    # Host discovery
     skip_ping: bool = False                 # -Pn
+    retries: int = 1                        # --retry N; 1 = no extra retries
+    randomize_hosts: bool = False           # --randomize-hosts
+    # Resolution / identification
+    no_dns: bool = False                    # -n / --no-dns
+    no_mac: bool = False                    # --no-mac
+    # Timing
     timing: int = 3                         # -T<N>; 3 = no override
+    host_timeout_ms: int = 0                # --host-timeout <ms>; 0 = auto
+    # Ports
+    no_ports: bool = False                  # -sn (skip port scan, ping only)
     top_ports: int = 0                      # --top-ports N; 0 = disabled
     randomize_ports: bool = False           # --randomize-ports
-    retries: int = 1                        # --retry N; 1 = no extra retries
+    max_parallel: int = 0                   # --max-parallel N; 0 = auto
+    # Exclusions
     exclude_text: str = ""                  # --exclude IPs / ranges
 
     def is_default(self) -> bool:
@@ -124,12 +139,24 @@ class ScanFlags:
         parts: list[str] = []
         if self.skip_ping:
             parts.append("-Pn")
+        if self.no_dns:
+            parts.append("-n")
+        if self.no_mac:
+            parts.append("--no-mac")
+        if self.no_ports:
+            parts.append("-sn")
         if self.timing != 3:
             parts.append(f"-T{self.timing}")
+        if self.host_timeout_ms > 0:
+            parts.append(f"--host-timeout {self.host_timeout_ms}ms")
+        if self.max_parallel > 0:
+            parts.append(f"--max-parallel {self.max_parallel}")
         if self.top_ports:
             parts.append(f"--top-ports {self.top_ports}")
         if self.randomize_ports:
             parts.append("--randomize-ports")
+        if self.randomize_hosts:
+            parts.append("--randomize-hosts")
         if self.retries > 1:
             parts.append(f"--retry {self.retries}")
         if self.exclude_text.strip():
@@ -149,7 +176,7 @@ class FlagsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Флаги сканирования")
         self.setModal(True)
-        self.resize(620, 480)
+        self.resize(680, 640)
         self._build_ui()
         self._apply_to_ui(current)
 
@@ -199,24 +226,86 @@ class FlagsDialog(QDialog):
         retry_row.addStretch(1)
         host_layout.addLayout(retry_row)
 
+        self.cb_randomize_hosts = QCheckBox()
+        rh_row = QHBoxLayout()
+        rh_row.addWidget(self.cb_randomize_hosts)
+        rh_row.addWidget(self._flag_label("--randomize-hosts"))
+        rh_row.addWidget(QLabel(
+            "Случайный порядок обхода адресов в цели"
+        ), 1)
+        host_layout.addLayout(rh_row)
+
         root.addWidget(host_box)
+
+        # ---- Resolution / identification ----
+        resolve_box = QGroupBox("Резолв и идентификация")
+        resolve_layout = QVBoxLayout(resolve_box)
+        resolve_layout.setSpacing(6)
+
+        self.cb_no_dns = QCheckBox()
+        nd_row = QHBoxLayout()
+        nd_row.addWidget(self.cb_no_dns)
+        nd_row.addWidget(self._flag_label("-n / --no-dns"))
+        nd_row.addWidget(QLabel(
+            "Не выполнять обратный DNS (отменяет «Имена хостов»)"
+        ), 1)
+        resolve_layout.addLayout(nd_row)
+
+        self.cb_no_mac = QCheckBox()
+        nm_row = QHBoxLayout()
+        nm_row.addWidget(self.cb_no_mac)
+        nm_row.addWidget(self._flag_label("--no-mac"))
+        nm_row.addWidget(QLabel(
+            "Не определять MAC и производителя (отменяет «MAC и производитель»)"
+        ), 1)
+        resolve_layout.addLayout(nm_row)
+
+        root.addWidget(resolve_box)
 
         # ---- Timing ----
         timing_box = QGroupBox("Тайминг")
-        timing_layout = QHBoxLayout(timing_box)
-        timing_layout.addWidget(self._flag_label("-T<N>"))
-        timing_layout.addWidget(QLabel("Шаблон скорости:"))
+        timing_layout = QVBoxLayout(timing_box)
+        timing_layout.setSpacing(6)
+
+        tt_row = QHBoxLayout()
+        tt_row.addWidget(self._flag_label("-T<N>"))
+        tt_row.addWidget(QLabel("Шаблон скорости:"))
         self.cmb_timing = QComboBox()
         for tid, (name, desc, _, _) in TIMING_TEMPLATES.items():
             self.cmb_timing.addItem(f"T{tid} — {name} ({desc})", tid)
         self.cmb_timing.setCurrentIndex(3)
-        timing_layout.addWidget(self.cmb_timing, 1)
+        tt_row.addWidget(self.cmb_timing, 1)
+        timing_layout.addLayout(tt_row)
+
+        self.cb_host_timeout = QCheckBox()
+        ht_row = QHBoxLayout()
+        ht_row.addWidget(self.cb_host_timeout)
+        ht_row.addWidget(self._flag_label("--host-timeout"))
+        ht_row.addWidget(QLabel("Таймаут TCP-конекта на порт:"))
+        self.sp_host_timeout = QSpinBox()
+        self.sp_host_timeout.setRange(50, 10000)
+        self.sp_host_timeout.setSingleStep(50)
+        self.sp_host_timeout.setValue(600)
+        self.sp_host_timeout.setSuffix(" мс")
+        ht_row.addWidget(self.sp_host_timeout)
+        ht_row.addStretch(1)
+        timing_layout.addLayout(ht_row)
+
         root.addWidget(timing_box)
 
         # ---- Ports ----
         ports_box = QGroupBox("Порты")
         ports_layout = QVBoxLayout(ports_box)
         ports_layout.setSpacing(6)
+
+        self.cb_no_ports = QCheckBox()
+        sn_row = QHBoxLayout()
+        sn_row.addWidget(self.cb_no_ports)
+        sn_row.addWidget(self._flag_label("-sn / --no-ports"))
+        sn_row.addWidget(QLabel(
+            "Только обнаружение хостов, без сканирования портов"
+        ), 1)
+        ports_layout.addLayout(sn_row)
 
         self.cb_top_ports = QCheckBox()
         top_row = QHBoxLayout()
@@ -238,6 +327,18 @@ class FlagsDialog(QDialog):
         rand_row.addWidget(self._flag_label("--randomize-ports"))
         rand_row.addWidget(QLabel("Случайный порядок сканирования портов"), 1)
         ports_layout.addLayout(rand_row)
+
+        self.cb_max_parallel = QCheckBox()
+        mp_row = QHBoxLayout()
+        mp_row.addWidget(self.cb_max_parallel)
+        mp_row.addWidget(self._flag_label("--max-parallel"))
+        mp_row.addWidget(QLabel("Параллельных портов на хост:"))
+        self.sp_max_parallel = QSpinBox()
+        self.sp_max_parallel.setRange(1, 1024)
+        self.sp_max_parallel.setValue(64)
+        mp_row.addWidget(self.sp_max_parallel)
+        mp_row.addStretch(1)
+        ports_layout.addLayout(mp_row)
 
         root.addWidget(ports_box)
 
@@ -278,16 +379,31 @@ class FlagsDialog(QDialog):
 
     # ----- Data binding -----
     def _apply_to_ui(self, f: ScanFlags) -> None:
+        # Host discovery
         self.cb_skip_ping.setChecked(f.skip_ping)
+        self.cb_retries.setChecked(f.retries > 1)
+        if f.retries > 1:
+            self.sp_retries.setValue(f.retries)
+        self.cb_randomize_hosts.setChecked(f.randomize_hosts)
+        # Resolution
+        self.cb_no_dns.setChecked(f.no_dns)
+        self.cb_no_mac.setChecked(f.no_mac)
+        # Timing
         idx = self.cmb_timing.findData(f.timing)
         self.cmb_timing.setCurrentIndex(idx if idx >= 0 else 3)
+        self.cb_host_timeout.setChecked(f.host_timeout_ms > 0)
+        if f.host_timeout_ms > 0:
+            self.sp_host_timeout.setValue(f.host_timeout_ms)
+        # Ports
+        self.cb_no_ports.setChecked(f.no_ports)
         self.cb_top_ports.setChecked(f.top_ports > 0)
         if f.top_ports > 0:
             self.sp_top_ports.setValue(f.top_ports)
         self.cb_randomize.setChecked(f.randomize_ports)
-        self.cb_retries.setChecked(f.retries > 1)
-        if f.retries > 1:
-            self.sp_retries.setValue(f.retries)
+        self.cb_max_parallel.setChecked(f.max_parallel > 0)
+        if f.max_parallel > 0:
+            self.sp_max_parallel.setValue(f.max_parallel)
+        # Exclusions
         self.le_exclude.setText(f.exclude_text)
 
     def _reset(self) -> None:
@@ -296,10 +412,20 @@ class FlagsDialog(QDialog):
     def get_flags(self) -> ScanFlags:
         return ScanFlags(
             skip_ping=self.cb_skip_ping.isChecked(),
+            retries=self.sp_retries.value() if self.cb_retries.isChecked() else 1,
+            randomize_hosts=self.cb_randomize_hosts.isChecked(),
+            no_dns=self.cb_no_dns.isChecked(),
+            no_mac=self.cb_no_mac.isChecked(),
             timing=int(self.cmb_timing.currentData()),
+            host_timeout_ms=(
+                self.sp_host_timeout.value() if self.cb_host_timeout.isChecked() else 0
+            ),
+            no_ports=self.cb_no_ports.isChecked(),
             top_ports=self.sp_top_ports.value() if self.cb_top_ports.isChecked() else 0,
             randomize_ports=self.cb_randomize.isChecked(),
-            retries=self.sp_retries.value() if self.cb_retries.isChecked() else 1,
+            max_parallel=(
+                self.sp_max_parallel.value() if self.cb_max_parallel.isChecked() else 0
+            ),
             exclude_text=self.le_exclude.text().strip(),
         )
 
@@ -757,7 +883,11 @@ class ScanTab(QWidget):
 
         self.btn_flags = QPushButton(" Флаги")
         self.btn_flags.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        self.btn_flags.setToolTip("Дополнительные флаги: -Pn, -T<N>, --top-ports, --exclude и др.")
+        self.btn_flags.setToolTip(
+            "Дополнительные флаги сканирования: -Pn, -n, --no-mac, -sn, "
+            "-T<N>, --host-timeout, --top-ports, --randomize-hosts, "
+            "--randomize-ports, --max-parallel, --retry, --exclude"
+        )
         self.btn_flags.clicked.connect(self._open_flags_dialog)
 
         actions.addWidget(self.btn_scan)
@@ -863,9 +993,11 @@ class ScanTab(QWidget):
         QTimer.singleShot(2500, self._restore_status_label)
 
     def _restore_status_label(self) -> None:
-        # Only revert the "Скопировано: …" notice; never overwrite an
-        # in-progress / finished scan status that the worker has set.
-        if self.status_label.text().startswith("Скопировано"):
+        # Only revert transient notices ("Скопировано: …", "SSH → …");
+        # never overwrite an in-progress / finished scan status that
+        # the worker has set.
+        text = self.status_label.text()
+        if text.startswith("Скопировано") or text.startswith("SSH →"):
             if self._worker is not None:
                 self.status_label.setText("Сканирование продолжается…")
             else:
@@ -874,6 +1006,15 @@ class ScanTab(QWidget):
     def _build_copy_menu(self, host: Host) -> QMenu:
         """Construct the copy popup for the given Host."""
         menu = QMenu(self)
+        # Actionable items first: if SSH (port 22) is open, expose a
+        # "connect via SSH" entry that spawns a terminal with `ssh user@host`.
+        if 22 in (host.open_ports or []):
+            target = host.hostname or host.ip
+            menu.addAction(
+                f"Зайти по SSH — {target}",
+                lambda: self._ssh_connect(host),
+            )
+            menu.addSeparator()
         if host.ip:
             menu.addAction(
                 f"Копировать IP — {host.ip}",
@@ -947,6 +1088,76 @@ class ScanTab(QWidget):
         ]
         self._copy_to_clipboard("\t".join(parts), "вся строка")
 
+    # ---------- SSH ----------
+    def _ssh_connect(self, host: Host) -> None:
+        """Open a terminal window running ``ssh <user>@<host>``.
+
+        Triggered from the row context menu when port 22 is open. Asks
+        the user for a login name (defaulting to the current OS user)
+        and then spawns the system OpenSSH client in a new console
+        window so the interactive session is visible.
+        """
+        target = host.hostname or host.ip
+        if not target:
+            return
+        default_user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+        user, ok = QInputDialog.getText(
+            self,
+            "SSH",
+            f"Имя пользователя для {target} (оставьте пустым для текущего):",
+            QLineEdit.Normal,
+            default_user,
+        )
+        if not ok:
+            return
+        user = user.strip()
+        target_arg = f"{user}@{target}" if user else target
+
+        try:
+            if IS_WINDOWS:
+                # CREATE_NEW_CONSOLE is Windows-only; use the literal so
+                # the import stays portable. `cmd /k` keeps the console
+                # open after ssh exits so the user can read the final
+                # messages instead of the window vanishing immediately.
+                CREATE_NEW_CONSOLE = 0x00000010
+                subprocess.Popen(
+                    ["cmd", "/k", "ssh", target_arg],
+                    creationflags=CREATE_NEW_CONSOLE,
+                )
+            else:
+                # Try a few common Linux/macOS terminals in priority order.
+                terminals = (
+                    ["x-terminal-emulator", "-e", "ssh", target_arg],
+                    ["gnome-terminal", "--", "ssh", target_arg],
+                    ["konsole", "-e", "ssh", target_arg],
+                    ["xterm", "-e", "ssh", target_arg],
+                )
+                last_err: Exception | None = None
+                for cmd in terminals:
+                    try:
+                        subprocess.Popen(cmd)
+                        last_err = None
+                        break
+                    except FileNotFoundError as exc:
+                        last_err = exc
+                        continue
+                if last_err is not None:
+                    raise last_err
+            self.status_label.setText(f"SSH → {target_arg}")
+            QTimer.singleShot(2500, self._restore_status_label)
+        except FileNotFoundError:
+            QMessageBox.critical(
+                self,
+                "SSH-клиент не найден",
+                "Не удалось запустить ssh.\n\n"
+                "Windows: установите компонент «OpenSSH Client» в "
+                "«Параметры → Приложения → Дополнительные компоненты».\n"
+                "Linux/macOS: убедитесь, что установлен ssh и хотя бы "
+                "один графический терминал (gnome-terminal, konsole, xterm).",
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, "Ошибка SSH", str(exc))
+
     # ---------- Scan control ----------
     def _parse_ports(self, text: str) -> list[int]:
         ports: set[int] = set()
@@ -1008,10 +1219,17 @@ class ScanTab(QWidget):
             if ans != QMessageBox.Yes:
                 return
 
-        # Build the port list. --top-ports overrides the manual ports field;
+        # --randomize-hosts: shuffle scan order (still report progress as
+        # int(sum(weights)), so the bar is unaffected).
+        if f.randomize_hosts:
+            random.shuffle(targets)
+
+        # Build the port list. -sn / --no-ports skips the port stage
+        # entirely; --top-ports overrides the manual ports field;
         # --randomize-ports shuffles the resulting list.
         ports: list[int] = []
-        if self.cb_ports.isChecked():
+        do_ports = self.cb_ports.isChecked() and not f.no_ports
+        if do_ports:
             if f.top_ports > 0:
                 ports = list(TOP_PORTS[:f.top_ports])
             else:
@@ -1047,14 +1265,19 @@ class ScanTab(QWidget):
         else:
             port_workers = 64
             port_timeout = 0.6
+        # Manual flag overrides take priority over the auto-pick above.
+        if f.host_timeout_ms > 0:
+            port_timeout = f.host_timeout_ms / 1000.0
+        if f.max_parallel > 0:
+            port_workers = f.max_parallel
 
         self._thread = QThread(self)
         self._worker = ScanWorker(
             targets=targets,
             ping_timeout_ms=ping_timeout_ms,
             workers=workers,
-            resolve_hostnames=self.cb_hostname.isChecked(),
-            detect_mac=self.cb_mac.isChecked(),
+            resolve_hostnames=self.cb_hostname.isChecked() and not f.no_dns,
+            detect_mac=self.cb_mac.isChecked() and not f.no_mac,
             ports=ports,
             port_timeout=port_timeout,
             port_workers=port_workers,
