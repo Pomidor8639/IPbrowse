@@ -10,7 +10,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 IS_WINDOWS = platform.system().lower() == "windows"
 # System encoding used to decode output of system utilities (ping, arp).
@@ -75,10 +75,15 @@ class Host:
     vendor: str = ""
     open_ports: list[int] = field(default_factory=list)
     response_ms: float | None = None
+    port_scan_done: int = 0
+    port_scan_total: int = 0
+    scan_complete: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["open_ports"] = ",".join(str(p) for p in self.open_ports)
+        for k in ("port_scan_done", "port_scan_total", "scan_complete"):
+            d.pop(k, None)
         return d
 
 
@@ -224,16 +229,29 @@ def scan_port(ip: str, port: int, timeout: float = 0.6) -> bool:
         return False
 
 
-def scan_ports(ip: str, ports: Iterable[int], timeout: float = 0.6, workers: int = 64) -> list[int]:
+def scan_ports(
+    ip: str,
+    ports: Iterable[int],
+    timeout: float = 0.6,
+    workers: int = 64,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> list[int]:
     ports = list(ports)
     if not ports:
         return []
     open_ports: list[int] = []
+    total = len(ports)
+    # Throttle progress reports to roughly 1% increments.
+    step = max(1, total // 100)
+    done = 0
     with ThreadPoolExecutor(max_workers=min(workers, max(1, len(ports)))) as pool:
         futures = {pool.submit(scan_port, ip, p, timeout): p for p in ports}
         for fut in as_completed(futures):
             if fut.result():
                 open_ports.append(futures[fut])
+            done += 1
+            if progress_cb and (done == total or done % step == 0):
+                progress_cb(done, total)
     open_ports.sort()
     return open_ports
 
@@ -246,20 +264,35 @@ def scan_network(
     detect_mac: bool = True,
     ports: Iterable[int] | None = None,
     port_timeout: float = 0.6,
+    port_workers: int = 64,
     cancel_event=None,
+    on_host_update: Callable[[Host], None] | None = None,
+    port_progress_cb: Callable[[str, int, int], None] | None = None,
 ) -> Iterator[Host]:
     """Yield Host objects as they are discovered.
 
-    The scan is performed in two phases: first a ping sweep, then for alive hosts
-    we resolve hostnames, MACs and ports. Results are yielded as soon as each
-    host is fully processed.
+    Phase 1 is a ping sweep that yields every IP — alive (with
+    ``scan_complete=False``) and dead (``scan_complete=True``) — as soon
+    as its status is known, so the UI can show active hosts immediately.
+    Phase 2 enriches each alive host with hostname, MAC, vendor and open
+    ports; an intermediate snapshot (hostname/MAC ready, ports pending)
+    is delivered through ``on_host_update`` and per-port progress through
+    ``port_progress_cb`` (``ip``, ``done``, ``total``). The fully-scanned
+    Host with ``scan_complete=True`` is then yielded by the iterator.
     """
     ports = list(ports or [])
+    total_ports = len(ports)
 
     # Phase 1: ping sweep in parallel
     def _check(ip: str) -> Host:
         alive, rtt = ping(ip, timeout_ms=ping_timeout_ms)
-        return Host(ip=ip, alive=alive, response_ms=rtt)
+        return Host(
+            ip=ip,
+            alive=alive,
+            response_ms=rtt,
+            port_scan_total=total_ports,
+            scan_complete=not alive,
+        )
 
     alive_hosts: list[Host] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -268,10 +301,9 @@ def scan_network(
             if cancel_event is not None and cancel_event.is_set():
                 break
             host = fut.result()
+            yield host
             if host.alive:
                 alive_hosts.append(host)
-            else:
-                yield host  # report dead hosts too (caller can filter)
 
     if cancel_event is not None and cancel_event.is_set():
         return
@@ -281,14 +313,37 @@ def scan_network(
 
     # Phase 2: enrich alive hosts (hostname, MAC, vendor, ports)
     def _enrich(host: Host) -> Host:
+        if cancel_event is not None and cancel_event.is_set():
+            host.scan_complete = True
+            return host
         if resolve_hostnames:
             host.hostname = resolve_hostname(host.ip)
         if detect_mac:
             host.mac = get_mac(host.ip, arp_cache)
             if host.mac:
                 host.vendor = lookup_vendor(host.mac)
-        if ports:
-            host.open_ports = scan_ports(host.ip, ports, timeout=port_timeout)
+        if on_host_update:
+            on_host_update(Host(
+                ip=host.ip, alive=host.alive, hostname=host.hostname,
+                mac=host.mac, vendor=host.vendor, response_ms=host.response_ms,
+                port_scan_done=0, port_scan_total=total_ports,
+                scan_complete=False,
+            ))
+        if ports and not (cancel_event is not None and cancel_event.is_set()):
+            def _cb(d: int, t: int) -> None:
+                host.port_scan_done = d
+                host.port_scan_total = t
+                if port_progress_cb:
+                    port_progress_cb(host.ip, d, t)
+            host.open_ports = scan_ports(
+                host.ip, ports,
+                timeout=port_timeout,
+                workers=port_workers,
+                progress_cb=_cb,
+            )
+        host.port_scan_done = total_ports
+        host.port_scan_total = total_ports
+        host.scan_complete = True
         return host
 
     with ThreadPoolExecutor(max_workers=min(workers, max(1, len(alive_hosts)))) as pool:
@@ -315,7 +370,7 @@ if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else detect_local_subnet()
     print(f"Scanning {target} ...")
     for h in scan_network(expand_target(target), ports=list(COMMON_PORTS.keys())):
-        if h.alive:
+        if h.alive and h.scan_complete:
             print(
                 f"{h.ip:15s}  {h.hostname or '-':30s}  {h.mac or '-':17s}  "
                 f"{h.vendor or '-':25s}  ports={h.open_ports}"

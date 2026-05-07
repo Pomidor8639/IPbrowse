@@ -15,6 +15,7 @@ from PySide6.QtCore import (
     QSortFilterProxyModel,
     Qt,
     QThread,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import QAction, QColor, QFont, QIcon
@@ -70,6 +71,7 @@ class HostsModel(QAbstractTableModel):
         super().__init__(parent)
         self._hosts: list[Host] = []
         self._show_dead = False
+        self._progress: dict[str, tuple[int, int]] = {}
 
     # ---- Qt model API ----
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: D401, B008
@@ -103,6 +105,14 @@ class HostsModel(QAbstractTableModel):
             if key == "response_ms":
                 return f"{host.response_ms:.1f}" if host.response_ms is not None else "—"
             if key == "open_ports":
+                if not host.scan_complete:
+                    progress = self._progress.get(host.ip)
+                    if progress and progress[1] > 0:
+                        d, t = progress
+                        return f"Сканирование портов… {int(d * 100 / t)}%"
+                    if host.alive and host.port_scan_total > 0:
+                        return "Ожидание сканирования…"
+                    return "—"
                 if not host.open_ports:
                     return "—"
                 parts = []
@@ -131,9 +141,12 @@ class HostsModel(QAbstractTableModel):
     def clear(self) -> None:
         self.beginResetModel()
         self._hosts.clear()
+        self._progress.clear()
         self.endResetModel()
 
     def upsert(self, host: Host) -> None:
+        if host.scan_complete:
+            self._progress.pop(host.ip, None)
         # Replace existing row for the same IP, or append.
         for i, existing in enumerate(self._hosts):
             if existing.ip == host.ip:
@@ -162,6 +175,17 @@ class HostsModel(QAbstractTableModel):
         self._hosts.append(host)
         self.endInsertRows()
 
+    def update_progress(self, ip: str, done: int, total: int) -> None:
+        self._progress[ip] = (done, total)
+        col = next((i for i, (k, _) in enumerate(COLUMNS) if k == "open_ports"), -1)
+        if col < 0:
+            return
+        for row, h in enumerate(self._visible_hosts()):
+            if h.ip == ip:
+                idx = self.index(row, col)
+                self.dataChanged.emit(idx, idx, [Qt.DisplayRole])
+                return
+
     def hosts(self) -> list[Host]:
         return list(self._hosts)
 
@@ -179,6 +203,7 @@ class ScanWorker(QObject):
 
     progress = Signal(int, int)  # done, total
     host_found = Signal(object)  # Host
+    port_progress = Signal(str, int, int)  # ip, done, total
     finished = Signal()
     error = Signal(str)
 
@@ -191,6 +216,7 @@ class ScanWorker(QObject):
         detect_mac: bool,
         ports: list[int],
         port_timeout: float,
+        port_workers: int = 64,
     ) -> None:
         super().__init__()
         self.targets = targets
@@ -200,6 +226,7 @@ class ScanWorker(QObject):
         self.detect_mac = detect_mac
         self.ports = ports
         self.port_timeout = port_timeout
+        self.port_workers = port_workers
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -210,6 +237,13 @@ class ScanWorker(QObject):
             total = len(self.targets)
             done = 0
             self.progress.emit(0, total)
+
+            def _on_partial(host: Host) -> None:
+                self.host_found.emit(host)
+
+            def _on_port_progress(ip: str, d: int, t: int) -> None:
+                self.port_progress.emit(ip, d, t)
+
             for host in scan_network(
                 self.targets,
                 ping_timeout_ms=self.ping_timeout_ms,
@@ -218,11 +252,15 @@ class ScanWorker(QObject):
                 detect_mac=self.detect_mac,
                 ports=self.ports,
                 port_timeout=self.port_timeout,
+                port_workers=self.port_workers,
                 cancel_event=self._cancel,
+                on_host_update=_on_partial,
+                port_progress_cb=_on_port_progress,
             ):
                 self.host_found.emit(host)
-                done += 1
-                self.progress.emit(done, total)
+                if host.scan_complete:
+                    done += 1
+                    self.progress.emit(done, total)
                 if self._cancel.is_set():
                     break
         except Exception as exc:  # noqa: BLE001
@@ -306,8 +344,8 @@ class MainWindow(QMainWindow):
         opts.addStretch(1)
         form.addRow("Дополнительно:", self._wrap(opts))
 
-        self.ports_edit = QLineEdit(",".join(str(p) for p in COMMON_PORTS))
-        self.ports_edit.setPlaceholderText("например, 22,80,443,3389 или 1-1024")
+        self.ports_edit = QLineEdit("1-65535")
+        self.ports_edit.setPlaceholderText("например, 22,80,443,3389 или 1-65535")
         self.cb_ports.toggled.connect(self.ports_edit.setEnabled)
         form.addRow("Порты:", self.ports_edit)
 
@@ -494,6 +532,16 @@ class MainWindow(QMainWindow):
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
+        # For wide port ranges (e.g. 1-65535) bump per-host scan parallelism
+        # and shorten the per-port timeout so the scan completes in reasonable
+        # time. Small port lists keep the conservative defaults.
+        if len(ports) > 1024:
+            port_workers = 128
+            port_timeout = 0.3
+        else:
+            port_workers = 64
+            port_timeout = 0.6
+
         self._thread = QThread(self)
         self._worker = ScanWorker(
             targets=targets,
@@ -502,11 +550,13 @@ class MainWindow(QMainWindow):
             resolve_hostnames=self.cb_hostname.isChecked(),
             detect_mac=self.cb_mac.isChecked(),
             ports=ports,
-            port_timeout=0.6,
+            port_timeout=port_timeout,
+            port_workers=port_workers,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.host_found.connect(self.model.upsert)
+        self._worker.port_progress.connect(self.model.update_progress)
         self._worker.progress.connect(self._on_progress)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._on_finished)
@@ -599,6 +649,8 @@ def main() -> int:
     app.setApplicationName("IPbrowse")
     window = MainWindow()
     window.show()
+    # Auto-start a full scan (all ports) right after the UI becomes visible.
+    QTimer.singleShot(0, window.start_scan)
     return app.exec()
 
 
