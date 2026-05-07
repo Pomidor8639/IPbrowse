@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -430,6 +431,13 @@ class HostsModel(QAbstractTableModel):
     def alive_hosts(self) -> list[Host]:
         return [h for h in self._hosts if h.alive]
 
+    def host_at(self, source_row: int) -> Host | None:
+        """Return the Host shown at the given source-model row, or None."""
+        visible = self._visible_hosts()
+        if 0 <= source_row < len(visible):
+            return visible[source_row]
+        return None
+
     def _visible_hosts(self) -> list[Host]:
         if self._show_dead:
             return self._hosts
@@ -763,6 +771,12 @@ class ScanTab(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setShowGrid(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        # Right-click → "Копировать IP / MAC / …" context menu, and a quick
+        # double-click anywhere copies the cell's content to the clipboard.
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_table_menu)
+        self.table.doubleClicked.connect(self._on_cell_double_clicked)
         widths = {0: 80, 1: 130, 2: 200, 3: 160, 4: 180, 5: 90}
         for col, w in widths.items():
             self.table.setColumnWidth(col, w)
@@ -800,6 +814,108 @@ class ScanTab(QWidget):
         else:
             self.lbl_flags.clear()
             self.lbl_flags.setVisible(False)
+
+    # ---------- Clipboard / context menu ----------
+    def _host_at_proxy(self, proxy_index: QModelIndex) -> Host | None:
+        if not proxy_index.isValid():
+            return None
+        src = self.proxy.mapToSource(proxy_index)
+        return self.model.host_at(src.row())
+
+    def _copy_to_clipboard(self, text: str, what: str) -> None:
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self.status_label.setText(f"✓ Скопировано: {what}")
+        QTimer.singleShot(2500, self._restore_status_label)
+
+    def _restore_status_label(self) -> None:
+        # Only revert the "✓ Скопировано: …" notice; never overwrite an
+        # in-progress / finished scan status that the worker has set.
+        if self.status_label.text().startswith("✓ Скопировано"):
+            if self._worker is not None:
+                self.status_label.setText("Сканирование продолжается…")
+            else:
+                self.status_label.setText("Готов к сканированию")
+
+    def _show_table_menu(self, pos) -> None:
+        proxy_index = self.table.indexAt(pos)
+        host = self._host_at_proxy(proxy_index)
+        if host is None:
+            return
+        menu = QMenu(self)
+        if host.ip:
+            menu.addAction(
+                f"📋 Копировать IP — {host.ip}",
+                lambda: self._copy_to_clipboard(host.ip, host.ip),
+            )
+        if host.hostname:
+            menu.addAction(
+                f"📋 Копировать имя хоста — {host.hostname}",
+                lambda: self._copy_to_clipboard(host.hostname, host.hostname),
+            )
+        if host.mac:
+            mac_up = host.mac.upper()
+            menu.addAction(
+                f"📋 Копировать MAC — {mac_up}",
+                lambda: self._copy_to_clipboard(mac_up, mac_up),
+            )
+        if host.vendor:
+            menu.addAction(
+                "📋 Копировать производителя",
+                lambda: self._copy_to_clipboard(host.vendor, host.vendor),
+            )
+        if host.open_ports:
+            ports_str = ", ".join(str(p) for p in host.open_ports)
+            menu.addAction(
+                "📋 Копировать список портов",
+                lambda: self._copy_to_clipboard(ports_str, "список портов"),
+            )
+        if menu.actions():
+            menu.addSeparator()
+        menu.addAction(
+            "📋 Копировать строку (TSV)",
+            lambda: self._copy_row(host),
+        )
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _copy_row(self, host: Host) -> None:
+        parts = [
+            host.ip,
+            host.hostname or "",
+            host.mac.upper() if host.mac else "",
+            host.vendor or "",
+            f"{host.response_ms:.1f}" if host.response_ms is not None else "",
+            ",".join(str(p) for p in host.open_ports),
+        ]
+        self._copy_to_clipboard("\t".join(parts), "вся строка")
+
+    def _on_cell_double_clicked(self, proxy_index: QModelIndex) -> None:
+        # Prefer the underlying Host field (raw IP, raw MAC) over the
+        # display string for ip/mac/hostname/vendor cells; fall back to
+        # the display text for everything else.
+        host = self._host_at_proxy(proxy_index)
+        if host is not None:
+            key = COLUMNS[proxy_index.column()][0]
+            value = ""
+            if key == "ip":
+                value = host.ip
+            elif key == "hostname":
+                value = host.hostname
+            elif key == "mac":
+                value = host.mac.upper() if host.mac else ""
+            elif key == "vendor":
+                value = host.vendor
+            if value:
+                self._copy_to_clipboard(value, value)
+                return
+        text = proxy_index.data(Qt.DisplayRole)
+        if not text or text == "—":
+            return
+        text = str(text)
+        if text.startswith("Сканирование"):
+            return  # progress placeholder, nothing useful to copy
+        self._copy_to_clipboard(text, text)
 
     # ---------- Scan control ----------
     def _parse_ports(self, text: str) -> list[int]:
