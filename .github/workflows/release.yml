@@ -28,21 +28,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # We split out ``data_sep`` (``:`` POSIX, ``;`` Windows) so the
+          # build step can quote the full ``--add-data`` value instead
+          # of relying on YAML / shell to preserve ``;`` correctly.
+          # That ``;`` is a statement separator in PowerShell *and*
+          # bash, so any unquoted form gets shredded on Windows.
           - os: ubuntu-latest
             artifact_name: IPbrowse-linux-x64.AppImage
             # Build with --onedir on Linux because AppImage wraps a
             # directory of binaries + libs rather than a self-extracting
             # blob. Wrapping a --onefile output inside AppImage would
             # double-unpack at startup for no benefit.
-            pyinstaller_args: --onedir --name IPbrowse --add-data ports.csv:. app.py
+            pyinstaller_extra: --onedir --name IPbrowse
+            data_sep: ":"
             built_path: dist/IPbrowse
             packager: appimage
           - os: windows-latest
             artifact_name: IPbrowse-windows-x64.exe
-            # Note the ``;`` separator — Windows uses it instead of ``:``
-            # in PyInstaller --add-data, otherwise PyInstaller treats the
-            # whole argument as a single source path.
-            pyinstaller_args: --windowed --onefile --name IPbrowse --add-data ports.csv;. app.py
+            pyinstaller_extra: --windowed --onefile --name IPbrowse
+            data_sep: ";"
             built_path: dist/IPbrowse.exe
             packager: none
           - os: macos-latest
@@ -50,7 +54,8 @@ jobs:
             # ``--windowed`` on macOS produces a proper ``.app`` bundle
             # rather than a bare CLI binary; we zip it below because
             # GitHub Releases can only host flat files.
-            pyinstaller_args: --windowed --name IPbrowse --add-data ports.csv:. app.py
+            pyinstaller_extra: --windowed --name IPbrowse
+            data_sep: ":"
             built_path: dist/IPbrowse.app
             packager: zip
 
@@ -80,14 +85,21 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # Force bash on every runner so the Windows entry's
-      # ``--add-data ports.csv;.`` doesn't get split by PowerShell —
-      # PowerShell treats ``;`` as a statement separator and reruns
-      # the binary against ``app.py`` as a separate (failing)
-      # command.
+      # We always run the build under bash (Git Bash on Windows
+      # runners) and quote the full ``--add-data`` value here,
+      # rather than baking it into ``matrix.pyinstaller_args``.
+      # ``;`` is a statement separator in both PowerShell and bash;
+      # leaving it unquoted made PyInstaller see only
+      # ``--add-data=ports.csv`` and bash try to dot-source
+      # ``app.py``. Wrapping the value in single quotes inside the
+      # script keeps ``;`` literal regardless of which interpreter
+      # ends up parsing it.
       - name: Build with PyInstaller
         shell: bash
-        run: pyinstaller ${{ matrix.pyinstaller_args }}
+        run: |
+          pyinstaller ${{ matrix.pyinstaller_extra }} \
+            --add-data="ports.csv${{ matrix.data_sep }}." \
+            app.py
 
       - name: Stage Windows binary
         if: matrix.packager == 'none'
