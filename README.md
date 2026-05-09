@@ -1,8 +1,14 @@
 # IPbrowse
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+[![Kotlin](https://img.shields.io/badge/kotlin-2.0-7f52ff.svg?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
+[![Android](https://img.shields.io/badge/android-26%2B-3ddc84.svg?logo=android&logoColor=white)](https://www.android.com/)
+[![Jetpack Compose](https://img.shields.io/badge/Jetpack%20Compose-Material%203-4285f4.svg)](https://developer.android.com/jetpack/compose)
 
-Сканер локальной сети с графическим интерфейсом на Python (PySide6).
+Сканер локальной сети с графическим интерфейсом. Десктоп — Python +
+PySide6, Android — Kotlin + Jetpack Compose. Сетевая логика общая по
+смыслу: TCP-connect сканер портов, реестр IANA, тёмная тема Catppuccin
+на обеих платформах.
 
 ## Возможности
 
@@ -60,13 +66,64 @@ python app.py
 python scanner.py 192.168.1.0/24
 ```
 
+## Android-версия
+
+Полноценный Android-клиент лежит в `android/`. Это отдельный
+Gradle-проект на **Kotlin 2.0** + **Jetpack Compose** + **Material 3**,
+тёмная тема Catppuccin одна-в-один с десктопом. Сетевая логика
+портирована из `scanner.py` и переписана под корутины: ping
+(TCP-fallback на 80 / 443 / 22 / 445 / 53 / 8080, потому что
+ICMP-echo на Android без root недоступен), TCP-connect-сканер портов,
+снятие баннеров (`-sV`), массовое сканирование, реестр IANA из
+`res/raw/ports.csv`. Кнопка «Узнать больше» по порту открывает поиск
+Google в локали `hl=ru`, как в десктопе.
+
+`min-sdk` 26 (Android 8.0), `target-sdk` 34. Пять вкладок: «Локальная
+сеть», «Внешние сети», «Wi-Fi», «Массовое сканирование», «О программе».
+
+### Сборка APK
+
+```bash
+cd android
+./gradlew assembleDebug          # → app/build/outputs/apk/debug/app-debug.apk
+```
+
+Перед первым запуском создайте `android/local.properties`:
+
+```properties
+sdk.dir=C\:\\Users\\<user>\\AppData\\Local\\Android\\Sdk
+```
+
+JDK 17 toolchain Gradle подтянет сам через
+`org.gradle.toolchains.foojay-resolver-convention`. Запускать
+`gradlew` можно из JBR Android Studio (Java 21).
+
+### Ограничения Android-версии
+
+- Без root настоящий ICMP-ping и доступ к ARP-таблице соседей
+  невозможны — это ограничение платформы. MAC и vendor у обычных
+  хостов будут пустые; для шлюза заполняются по `LinkProperties`.
+- Никакого nmap-инсталлера / nmap-флагов на Android нет — это
+  десктопная фича.
+
+Подробнее о структуре кода и решениях — `AGENTS.md` (локальный, не
+коммитится).
+
 ## Структура проекта
 
 ```
 IPbrowse/
-├── app.py            # PySide6 GUI
-├── scanner.py        # логика сканирования
-├── requirements.txt  # зависимости
+├── app.py                    # PySide6 GUI (десктоп)
+├── scanner.py                # логика сканирования (десктоп)
+├── ports.csv                 # реестр портов IANA
+├── android/                  # Android-версия
+│   ├── app/src/main/kotlin/
+│   │   └── com/ipbrowse/     # MainActivity, scanner/, ui/
+│   ├── app/src/main/res/raw/ports.csv
+│   ├── build.gradle.kts
+│   └── settings.gradle.kts
+├── resources/icon.png        # общая иконка приложения
+├── requirements.txt          # зависимости (десктоп)
 └── README.md
 ```
 
