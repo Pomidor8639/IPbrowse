@@ -53,6 +53,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.ipbrowse.scanner.Host
 import com.ipbrowse.scanner.WifiInfo
 import com.ipbrowse.ui.ScanViewModel
@@ -262,7 +263,12 @@ fun ScanScreen(
                             it.vendor.contains(q, true) ||
                             it.osGuess.contains(q, true) ||
                             it.openPorts.any { p -> p.toString().contains(q) }
-                    }.toList()
+                    }
+                    // Лексикографическая сортировка строк давала «.1, .10, .100, .11, .2…»;
+                    // конвертируем октеты в Long и сортируем как обычные числа,
+                    // чтобы ряд .1, .2, ..., .254 шёл в естественном порядке.
+                    .sortedBy { ipSortKey(it.ip) }
+                    .toList()
             }
 
             HostsTableHeader()
@@ -319,9 +325,12 @@ private fun HostsTableHeader() {
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(vertical = 6.dp, horizontal = 8.dp),
     ) {
+        // Колонка IP теперь шире (1.4f → 1.7f), чтобы умещался даже самый
+        // длинный IPv4 («255.255.255.255») крупным жирным моноширинным шрифтом
+        // без переноса.
         Text(
             text = "IP",
-            modifier = Modifier.weight(1.4f),
+            modifier = Modifier.weight(1.7f),
             color = MaterialTheme.colorScheme.primary,
             fontWeight = FontWeight.Bold,
         )
@@ -340,6 +349,23 @@ private fun HostsTableHeader() {
     }
 }
 
+/**
+ * Числовой ключ для сортировки IPv4: строка «192.168.1.10» превращается в
+ * Long, который сортируется как нормальное число. Невалидные значения
+ * (мусор в фильтре, IPv6 и т.п.) уезжают в конец списка через Long.MAX_VALUE.
+ */
+private fun ipSortKey(ip: String): Long {
+    val parts = ip.split(".")
+    if (parts.size != 4) return Long.MAX_VALUE
+    var v = 0L
+    for (p in parts) {
+        val o = p.toIntOrNull() ?: return Long.MAX_VALUE
+        if (o !in 0..255) return Long.MAX_VALUE
+        v = (v shl 8) or o.toLong()
+    }
+    return v
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun HostsRow(host: Host, onClick: () -> Unit, onLongClick: () -> Unit) {
@@ -356,17 +382,22 @@ private fun HostsRow(host: Host, onClick: () -> Unit, onLongClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 44.dp)
+            .heightIn(min = 48.dp)
             .background(MaterialTheme.colorScheme.surface)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(vertical = 6.dp, horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1.4f)) {
+        // IP — главная информация в строке, поэтому моноширинный 17 sp
+        // полужирным, цвет — primary/outline в зависимости от статуса хоста.
+        // Колонка тоже шире (1.4f → 1.7f), чтобы влезал «255.255.255.255».
+        Column(modifier = Modifier.weight(1.7f)) {
             Text(
                 text = host.ip,
                 fontFamily = FontFamily.Monospace,
                 color = color,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 17.sp,
             )
             if (host.osGuess.isNotEmpty()) {
                 Text(

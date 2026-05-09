@@ -21,7 +21,11 @@ import kotlinx.coroutines.launch
  */
 data class ScanUiState(
     val target: String = "",
-    val ports: String = "22,80,443,3389",
+    // По умолчанию пробуем все 65535 портов — пользователю проще
+    // увидеть всё открытое на каждом хосте сразу, без ручной настройки.
+    // Поле всё равно редактируется, так что узкий профиль вроде "22,80,443"
+    // можно вписать вручную или скопировать из шаблона placeholder.
+    val ports: String = "1-65535",
     val resolveHostnames: Boolean = true,
     val skipPing: Boolean = false,
     val osDetect: Boolean = false,
@@ -51,6 +55,11 @@ class ScanViewModel : ViewModel() {
 
     private var scanJob: Job? = null
 
+    // Защита от повторного автозапуска: подсеть может прийти из WifiInfo
+    // несколько раз (рефреш, рекомпозиция), но автоскан должен сработать
+    // ровно один раз за жизнь ViewModel'а — дальше пользователь сам.
+    private var autoScanLaunched = false
+
     fun setTarget(value: String) = _state.update { it.copy(target = value) }
     fun setPorts(value: String) = _state.update { it.copy(ports = value) }
     fun setFilter(value: String) = _state.update { it.copy(filter = value) }
@@ -69,6 +78,19 @@ class ScanViewModel : ViewModel() {
 
     fun setDefaultTarget(value: String) {
         _state.update { if (it.target.isBlank()) it.copy(target = value) else it }
+    }
+
+    /**
+     * Запустить сканирование автоматически — если ещё ни разу не запускали,
+     * нет активного скана и нет уже отрисованных хостов. Дёргается из
+     * `IPbrowseApp` сразу после того, как `WifiInfo` отдал первую подсеть.
+     */
+    fun autoStartScanIfIdle() {
+        if (autoScanLaunched) return
+        val s = _state.value
+        if (s.isScanning || s.target.isBlank() || s.hosts.isNotEmpty()) return
+        autoScanLaunched = true
+        startScan()
     }
 
     /**

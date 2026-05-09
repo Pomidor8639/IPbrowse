@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
@@ -59,10 +60,14 @@ fun IPbrowseApp() {
     // WifiInfo.read блокирует главный поток (NetworkInterface, ConnectivityManager),
     // поэтому используем тот же ViewModel, что и Wi-Fi-вкладка — он уже
     // вызывает read() через Dispatchers.IO. Реактивно подсовываем результат
-    // в дефолтную цель локальной вкладки.
+    // в дефолтную цель локальной вкладки и автоматически запускаем первое
+    // сканирование, как только подсеть определилась.
     val wifiState by wifiVm.state.collectAsState()
     LaunchedEffect(wifiState.snapshot.subnetCidr) {
-        wifiState.snapshot.subnetCidr?.let { localVm.setDefaultTarget(it) }
+        wifiState.snapshot.subnetCidr?.let {
+            localVm.setDefaultTarget(it)
+            localVm.autoStartScanIfIdle()
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
@@ -70,11 +75,20 @@ fun IPbrowseApp() {
             selectedTabIndex = selected,
             modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
             edgePadding = 0.dp,
+            // У Material 3 Tab невыбранный текст рисуется через
+            // LocalContentColor с пониженной альфой и в тёмной теме это
+            // читается как «полупрозрачные буквы». Задаём явные цвета:
+            // контейнер — surface, контент — onSurface (полная непрозрачность),
+            // а активную вкладку вытягиваем к primary через сам Tab ниже.
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface,
         ) {
             tabs.forEachIndexed { index, title ->
                 Tab(
                     selected = selected == index,
                     onClick = { selected = index },
+                    selectedContentColor = MaterialTheme.colorScheme.primary,
+                    unselectedContentColor = MaterialTheme.colorScheme.onSurface,
                     text = {
                         Text(
                             text = title,
