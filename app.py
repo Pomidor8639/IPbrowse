@@ -3238,6 +3238,77 @@ def nmap_available() -> bool:
     return shutil.which("nmap") is not None
 
 
+def refresh_windows_path_from_registry() -> None:
+    """Pull the latest ``HKLM`` + ``HKCU`` ``Environment\\Path`` into
+    ``os.environ["PATH"]``.
+
+    Why this exists: if a user installs nmap (or anything else) into
+    a directory the official installer adds to the system PATH, but
+    IPbrowse was launched *before* that change took effect, the
+    running Python process keeps the parent shell's stale PATH. New
+    cmd.exe windows pick up the fresh PATH because Explorer reacted
+    to ``WM_SETTINGCHANGE``; a long-running launcher / pinned
+    shortcut / packaged installer often does not. Symptom: the user
+    has nmap, ``nmap`` works in cmd, but ``shutil.which("nmap")``
+    inside IPbrowse keeps returning ``None``.
+
+    The fix is to skip Explorer entirely and read the persistent
+    PATH directly from the registry, then merge anything new into
+    the live process environment. We *append* rather than replace —
+    custom ``PATH`` entries the user passed via a launch script
+    must keep working.
+
+    No-op on POSIX: there is no equivalent persistent PATH store
+    that processes don't already see at fork time.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return
+
+    parts: list[str] = []
+    for hive, sub in (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, sub) as key:
+                try:
+                    raw, _ = winreg.QueryValueEx(key, "Path")
+                except FileNotFoundError:
+                    continue
+                if not raw:
+                    continue
+                # REG_EXPAND_SZ may contain ``%USERPROFILE%`` etc.;
+                # the OS would expand these when launching a new
+                # process, so we mimic that here.
+                expanded = os.path.expandvars(raw)
+                for entry in expanded.split(os.pathsep):
+                    entry = entry.strip()
+                    if entry:
+                        parts.append(entry)
+        except OSError:
+            continue
+    if not parts:
+        return
+    cur = os.environ.get("PATH", "")
+    cur_set = {
+        p.strip().lower().rstrip("\\")
+        for p in cur.split(os.pathsep)
+        if p.strip()
+    }
+    additions = [
+        p for p in parts
+        if p.lower().rstrip("\\") not in cur_set
+    ]
+    if additions:
+        new_path = (cur + os.pathsep if cur else "") + os.pathsep.join(additions)
+        os.environ["PATH"] = new_path
+
+
 def find_nmap_anywhere() -> Path | None:
     """Locate an installed ``nmap`` binary, even when PATH doesn't list it.
 
@@ -4407,6 +4478,11 @@ def maybe_offer_nmap_install(parent: QWidget) -> None:
     (``nmap/dont_ask_again``) so the user only has to dismiss
     once across launches.
     """
+    # Refresh PATH from the registry first — covers the
+    # "installed nmap, cmd sees it, IPbrowse doesn't" symptom that
+    # comes from a stale parent-process environment block. See
+    # :func:`refresh_windows_path_from_registry` for the details.
+    refresh_windows_path_from_registry()
     if nmap_available():
         return
     settings = QSettings("IPbrowse", "IPbrowse")
@@ -4414,9 +4490,60 @@ def maybe_offer_nmap_install(parent: QWidget) -> None:
         return
     found = find_nmap_anywhere()
     if found is not None:
+        # We found nmap on disk but it isn't in our process PATH. If
+        # its directory is *already* in the user's persistent PATH
+        # (the registry write some other tool already did), we just
+        # patch ``os.environ`` and skip the dialog — the user has
+        # nothing to fix, our environment block was just stale.
+        nmap_dir = str(found.parent)
+        if _directory_in_persistent_windows_path(found.parent):
+            sep = os.pathsep
+            cur = os.environ.get("PATH", "")
+            if nmap_dir.lower() not in cur.lower().split(sep):
+                os.environ["PATH"] = (cur + sep + nmap_dir) if cur else nmap_dir
+            return
         NmapAddToPathDialog(found, parent).exec()
         return
     NmapInstallDialog(parent).exec()
+
+
+def _directory_in_persistent_windows_path(directory: Path) -> bool:
+    """True if ``directory`` already lives in the registry PATH.
+
+    Used by :func:`maybe_offer_nmap_install` to skip the
+    "add to PATH" dialog when the user's *persistent* PATH already
+    has the directory — only the running process's environment
+    block is stale, which we patch silently.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+
+    target = str(directory).lower().rstrip("\\")
+    for hive, sub in (
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, sub) as key:
+                try:
+                    raw, _ = winreg.QueryValueEx(key, "Path")
+                except FileNotFoundError:
+                    continue
+                if not raw:
+                    continue
+                expanded = os.path.expandvars(raw)
+                for entry in expanded.split(os.pathsep):
+                    entry = entry.strip().lower().rstrip("\\")
+                    if entry == target:
+                        return True
+        except OSError:
+            continue
+    return False
 
 
 class MainWindow(QMainWindow):

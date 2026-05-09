@@ -28,8 +28,16 @@ IPbrowse — настольный сканер локальной сети с GU
   типичным софтом и кнопкой **«Узнать больше»** — открывает поиск
   Google на русском языке (`hl=ru`, запрос вида «что такое порт N tcp»).
 - Вкладка «О программе».
-- **Авто-установка Nmap.** На старте `maybe_offer_nmap_install`
-  выбирает один из трёх сценариев:
+- **Авто-установка Nmap.** Перед любой проверкой
+  `maybe_offer_nmap_install` вызывает
+  `refresh_windows_path_from_registry()` — читает `HKLM\SYSTEM\…\
+  Environment\Path` и `HKCU\Environment\Path` напрямую и
+  дописывает в `os.environ["PATH"]` всё, чего там не было. Это
+  лечит ситуацию «cmd видит nmap, IPbrowse — нет»: процесс мог
+  стартовать с устаревшим PATH (например, лончер не получил
+  `WM_SETTINGCHANGE`), а реестр уже содержит свежий PATH.
+  После рефреша `maybe_offer_nmap_install` выбирает один из трёх
+  сценариев:
   1. `shutil.which("nmap")` вернул путь — ничего не делаем.
   2. Не на PATH, но найден через `find_nmap_anywhere()` — открывается
      `NmapAddToPathDialog`. Под Windows кнопка «Добавить в PATH»

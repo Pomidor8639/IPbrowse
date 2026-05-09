@@ -29,10 +29,14 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: IPbrowse-linux-x64
-            pyinstaller_args: --onefile --name IPbrowse --add-data ports.csv:. app.py
+            artifact_name: IPbrowse-linux-x64.AppImage
+            # Build with --onedir on Linux because AppImage wraps a
+            # directory of binaries + libs rather than a self-extracting
+            # blob. Wrapping a --onefile output inside AppImage would
+            # double-unpack at startup for no benefit.
+            pyinstaller_args: --onedir --name IPbrowse --add-data ports.csv:. app.py
             built_path: dist/IPbrowse
-            needs_zip: false
+            packager: appimage
           - os: windows-latest
             artifact_name: IPbrowse-windows-x64.exe
             # Note the ``;`` separator — Windows uses it instead of ``:``
@@ -40,7 +44,7 @@ jobs:
             # whole argument as a single source path.
             pyinstaller_args: --windowed --onefile --name IPbrowse --add-data ports.csv;. app.py
             built_path: dist/IPbrowse.exe
-            needs_zip: false
+            packager: none
           - os: macos-latest
             artifact_name: IPbrowse-macos-arm64.zip
             # ``--windowed`` on macOS produces a proper ``.app`` bundle
@@ -48,7 +52,7 @@ jobs:
             # GitHub Releases can only host flat files.
             pyinstaller_args: --windowed --name IPbrowse --add-data ports.csv:. app.py
             built_path: dist/IPbrowse.app
-            needs_zip: true
+            packager: zip
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -79,19 +83,79 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller ${{ matrix.pyinstaller_args }}
 
-      - name: Stage Linux / Windows binary
-        if: matrix.needs_zip == false
+      - name: Stage Windows binary
+        if: matrix.packager == 'none'
         shell: bash
         run: |
           mv "${{ matrix.built_path }}" "${{ matrix.artifact_name }}"
 
       - name: Zip macOS .app bundle
-        if: matrix.needs_zip == true
+        if: matrix.packager == 'zip'
         run: |
           cd dist
           # Preserve the .app's internal symlinks (``-y``) so launching
           # it after unzip still works on the user's Mac.
           zip -ry "../${{ matrix.artifact_name }}" "$(basename '${{ matrix.built_path }}')"
+
+      # ---- Linux: wrap PyInstaller --onedir output into an AppImage ----
+      # AppImage gives a single self-contained file that runs on any
+      # modern glibc-based distro without the user having to install
+      # Qt / Python. ``appimagetool`` expects an AppDir layout with an
+      # AppRun entry point, a top-level .desktop file, and a top-level
+      # icon; we construct those around the PyInstaller output.
+      - name: Package Linux AppImage
+        if: matrix.packager == 'appimage'
+        run: |
+          set -euo pipefail
+
+          # 1. appimagetool is itself an AppImage, so it needs libfuse2
+          # at runtime on the runner. The Qt libs were already fetched
+          # by the earlier apt-get step for the PyInstaller build.
+          sudo apt-get install -y libfuse2
+
+          # 2. Lay out the AppDir. PyInstaller puts the binary +
+          # _internal/ alongside each other in dist/IPbrowse/; we drop
+          # that into usr/bin/ and then symlink the executable to the
+          # root as AppRun.
+          APPDIR=IPbrowse.AppDir
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin"
+          cp -r dist/IPbrowse/. "$APPDIR/usr/bin/"
+
+          # 3. AppRun is the entry point appimagetool invokes. A shell
+          # wrapper lets us forward the user's CWD and any arguments
+          # they pass without PyInstaller losing track of resource
+          # paths.
+          cat > "$APPDIR/AppRun" <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/IPbrowse" "$@"
+          APPRUN
+          chmod +x "$APPDIR/AppRun"
+
+          # 4. Required metadata: .desktop entry + top-level icon.
+          cat > "$APPDIR/IPbrowse.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=IPbrowse
+          Comment=Сканер локальной сети
+          Exec=IPbrowse
+          Icon=IPbrowse
+          Categories=Network;System;
+          Terminal=false
+          DESKTOP
+          cp resources/icon.png "$APPDIR/IPbrowse.png"
+
+          # 5. Fetch appimagetool. The ``continuous`` release is the
+          # recommended stable build for scripts — pin by sha256 if
+          # supply-chain strictness ever matters.
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          # 6. ARCH env var is how appimagetool decides the embedded
+          # runtime; without it the tool refuses to build on CI.
+          ARCH=x86_64 ./appimagetool "$APPDIR" "${{ matrix.artifact_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
