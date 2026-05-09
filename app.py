@@ -6,12 +6,15 @@ import json
 import os
 import random
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -22,6 +25,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QObject,
     QPointF,
+    QSettings,
     QSortFilterProxyModel,
     Qt,
     QThread,
@@ -3201,6 +3205,587 @@ def _checkmark_icon_path() -> str:
     return cache.as_posix()
 
 
+# ---------------------------------------------------------------------------
+# Nmap auto-install support
+# ---------------------------------------------------------------------------
+#
+# IPbrowse's own scanner is pure-Python TCP-connect, so nmap is *not* a
+# hard dependency. The Flags dialog, however, lists a number of modes
+# (-sS, -sU, -O, NSE, …) that genuinely require nmap, and the user
+# wants the program to offer a one-click install on first launch when
+# the binary isn't on PATH. The flow:
+#
+#   1.  ``nmap_available()`` — ``shutil.which`` lookup.
+#   2.  Modal ``NmapInstallDialog`` is opened from ``MainWindow`` after
+#       the GUI has had a tick to paint, gated by a QSettings
+#       suppression flag the user can set with a checkbox.
+#   3.  Windows: ``NmapDownloadWorker`` streams the official setup.exe
+#       (latest version scraped from nmap.org/download.html, falling
+#       back to a pinned release) into a temp dir; ``os.startfile``
+#       launches it. The Nmap installer's manifest declares
+#       ``requireAdministrator`` so Windows raises the UAC prompt
+#       on its own.
+#   4.  Linux / macOS: package-manager + system-terminal detection,
+#       the chosen install command is pre-filled into a freshly
+#       launched terminal so the user just types the sudo password.
+
+NMAP_FALLBACK_VERSION = "7.95"
+NMAP_DOWNLOAD_PAGE = "https://nmap.org/download.html"
+
+
+def nmap_available() -> bool:
+    """Return True if an ``nmap`` executable is on the user's PATH."""
+    return shutil.which("nmap") is not None
+
+
+def _nmap_version_key(v: str) -> tuple[int, ...]:
+    """Sort key for ``nmap-X.YZ`` style version strings."""
+    return tuple(int(p) for p in v.split(".") if p.isdigit())
+
+
+def resolve_nmap_installer_url() -> tuple[str, str]:
+    """Return ``(url, filename)`` for the latest Windows setup binary.
+
+    Tries to scrape ``nmap-X.YZ-setup.exe`` filenames out of
+    ``nmap.org/download.html`` and pick the highest version. Any
+    network / parsing failure falls back to the pinned
+    :data:`NMAP_FALLBACK_VERSION`. The function never raises.
+    """
+    fallback_url = (
+        f"https://nmap.org/dist/nmap-{NMAP_FALLBACK_VERSION}-setup.exe"
+    )
+    fallback_name = f"nmap-{NMAP_FALLBACK_VERSION}-setup.exe"
+    try:
+        req = urllib.request.Request(
+            NMAP_DOWNLOAD_PAGE,
+            headers={"User-Agent": "IPbrowse"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read(256_000).decode("utf-8", errors="replace")
+        versions = set(re.findall(
+            r"nmap-(\d+\.\d+(?:\.\d+)?)-setup\.exe", html
+        ))
+        if versions:
+            latest = max(versions, key=_nmap_version_key)
+            return (
+                f"https://nmap.org/dist/nmap-{latest}-setup.exe",
+                f"nmap-{latest}-setup.exe",
+            )
+    except Exception:
+        pass
+    return (fallback_url, fallback_name)
+
+
+def _detect_install_command() -> tuple[str, str] | None:
+    """Pick a (pretty_name, command) pair for the host's package manager.
+
+    Returns ``None`` if no supported package manager is on PATH,
+    which is when the dialog should fall back to a copy/paste-only
+    instruction screen.
+    """
+    if sys.platform == "darwin":
+        if shutil.which("brew"):
+            return ("Homebrew", "brew install nmap")
+        if shutil.which("port"):
+            return ("MacPorts", "sudo port install nmap")
+        return None
+    if sys.platform != "linux":
+        return None
+    candidates: tuple[tuple[str, str], ...] = (
+        ("apt",     "sudo apt update && sudo apt install -y nmap"),
+        ("apt-get", "sudo apt-get update && sudo apt-get install -y nmap"),
+        ("dnf",     "sudo dnf install -y nmap"),
+        ("yum",     "sudo yum install -y nmap"),
+        ("pacman",  "sudo pacman -S --noconfirm nmap"),
+        ("zypper",  "sudo zypper install -y nmap"),
+        ("apk",     "sudo apk add nmap"),
+        ("emerge",  "sudo emerge --ask=n net-analyzer/nmap"),
+    )
+    for name, cmd in candidates:
+        if shutil.which(name):
+            return (name, cmd)
+    return None
+
+
+def _open_terminal_with(command: str) -> bool:
+    """Spawn the system terminal and run ``command`` inside it.
+
+    The terminal stays open after the command finishes (we tack a
+    ``read`` onto the end of the script) so the user can read any
+    apt / brew output. Returns ``True`` on a successful spawn.
+    """
+    if sys.platform == "darwin":
+        # AppleScript ``do script`` opens (or focuses) Terminal.app and
+        # types the line into a fresh tab.
+        escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            f'tell application "Terminal"\n'
+            f'    activate\n'
+            f'    do script "{escaped}"\n'
+            f'end tell'
+        )
+        try:
+            subprocess.Popen(["osascript", "-e", script])
+            return True
+        except (OSError, FileNotFoundError):
+            return False
+    if sys.platform != "linux":
+        return False
+    pause_tail = (
+        '; echo; '
+        'echo "[Установка завершена. Нажмите Enter, чтобы закрыть окно.]"; '
+        'read _'
+    )
+    full = command + pause_tail
+    # Order matters: x-terminal-emulator is the Debian Alternatives
+    # symlink, so it picks the user's default. Concrete emulators
+    # follow as fallbacks for distros without the alternatives system.
+    candidates: tuple[tuple[str, list[str]], ...] = (
+        ("x-terminal-emulator", ["x-terminal-emulator", "-e", "bash", "-lc", full]),
+        ("gnome-terminal",      ["gnome-terminal", "--", "bash", "-lc", full]),
+        ("konsole",             ["konsole", "-e", "bash", "-lc", full]),
+        ("xfce4-terminal",      ["xfce4-terminal", "-e", f"bash -lc '{full}'"]),
+        ("kitty",               ["kitty", "bash", "-lc", full]),
+        ("alacritty",           ["alacritty", "-e", "bash", "-lc", full]),
+        ("tilix",               ["tilix", "-e", "bash", "-lc", full]),
+        ("xterm",               ["xterm", "-e", "bash", "-lc", full]),
+    )
+    for name, argv in candidates:
+        if shutil.which(name):
+            try:
+                subprocess.Popen(argv)
+                return True
+            except (OSError, FileNotFoundError):
+                continue
+    return False
+
+
+class NmapDownloadWorker(QThread):
+    """Streams a file from ``url`` into ``target`` with progress.
+
+    ``progress(bytes_done, bytes_total, kbps)`` fires every chunk;
+    ``done(path)`` on success; ``failed(message)`` on any error or
+    user cancellation. ``cancel()`` requests an orderly stop — the
+    partially-downloaded file is removed before the signal fires.
+    """
+
+    progress = Signal(int, int, float)
+    done = Signal(str)
+    failed = Signal(str)
+
+    _CHUNK = 64 * 1024  # 64 KiB — modest RAM, plenty of progress ticks
+
+    def __init__(self, url: str, target: Path) -> None:
+        super().__init__()
+        self.url = url
+        self.target = target
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:  # noqa: D401  (Qt slot)
+        try:
+            req = urllib.request.Request(
+                self.url,
+                headers={"User-Agent": "IPbrowse"},
+            )
+            self.target.parent.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+                done = 0
+                start = time.monotonic()
+                with self.target.open("wb") as fh:
+                    while not self._cancel:
+                        chunk = resp.read(self._CHUNK)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        done += len(chunk)
+                        elapsed = max(0.001, time.monotonic() - start)
+                        kbps = (done / 1024.0) / elapsed
+                        self.progress.emit(done, total, kbps)
+            if self._cancel:
+                self._unlink_quietly()
+                self.failed.emit("Загрузка отменена пользователем.")
+                return
+            self.done.emit(str(self.target))
+        except Exception as exc:  # noqa: BLE001
+            self._unlink_quietly()
+            self.failed.emit(f"Ошибка загрузки: {exc}")
+
+    def _unlink_quietly(self) -> None:
+        try:
+            self.target.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class NmapInstallDialog(QDialog):
+    """Modal: detects nmap and offers to download / install it.
+
+    Stack layout with four pages:
+
+    ====== ==========================================================
+    index  page
+    ====== ==========================================================
+    0      prompt — explanation + Download / Cancel + don't-ask
+    1      progress — bytes, percentage, KB/s + Cancel
+    2      done — success message + Launch installer (Windows only)
+    3      error — error text + Retry / Close
+    ====== ==========================================================
+
+    On non-Windows hosts the prompt page text and primary action are
+    swapped to "open terminal" rather than "download" — see
+    :func:`_detect_install_command` and :func:`_open_terminal_with`
+    for the packaging logic.
+    """
+
+    SETTINGS_KEY = "nmap/dont_ask_again"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Установка Nmap")
+        self.setModal(True)
+        self.resize(560, 280)
+
+        self._worker: NmapDownloadWorker | None = None
+        self._installer_path: str | None = None
+        self._download_url: str | None = None
+
+        self._stack = QStackedWidget(self)
+        self._build_prompt_page()
+        self._build_progress_page()
+        self._build_done_page()
+        self._build_error_page()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.addWidget(self._stack, 1)
+
+        self._stack.setCurrentIndex(0)
+
+    # -- pages -------------------------------------------------------
+    def _build_prompt_page(self) -> None:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setSpacing(10)
+
+        title = QLabel("Утилита Nmap не обнаружена в системе")
+        f = QFont()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #89b4fa;")
+        v.addWidget(title)
+
+        if IS_WINDOWS:
+            body_text = (
+                "Сторонняя утилита <b>nmap</b> используется для "
+                "расширенных режимов сканирования (-sS, -sU, -O, NSE "
+                "и т. п.). IPbrowse может скачать официальный "
+                "установщик с <a href=\"https://nmap.org\" "
+                "style=\"color:#89b4fa;\">nmap.org</a> и запустить "
+                "его. После загрузки Windows покажет UAC-запрос "
+                "о повышении прав — это нормально."
+            )
+            primary_label = "Скачать и установить"
+        else:
+            pm = _detect_install_command()
+            if pm is not None:
+                pm_name, pm_cmd = pm
+                body_text = (
+                    f"Сторонняя утилита <b>nmap</b> используется для "
+                    f"расширенных режимов сканирования (-sS, -sU, "
+                    f"-O, NSE и т. п.). Найден пакетный менеджер "
+                    f"<b>{pm_name}</b>. Можно открыть терминал и "
+                    f"выполнить:<br><br>"
+                    f"<code style=\"color:#a6e3a1;\">{pm_cmd}</code>"
+                    f"<br><br>Терминал останется открытым, чтобы "
+                    f"вы видели вывод. Возможно, потребуется "
+                    f"ввести пароль root."
+                )
+                primary_label = "Открыть терминал и установить"
+            else:
+                body_text = (
+                    "Сторонняя утилита <b>nmap</b> используется для "
+                    "расширенных режимов сканирования. Не удалось "
+                    "автоматически определить пакетный менеджер на "
+                    "вашей системе.<br><br>Установите nmap вручную "
+                    "штатными средствами вашего дистрибутива."
+                )
+                primary_label = ""  # disable the button below
+
+        body = QLabel(body_text)
+        body.setTextFormat(Qt.RichText)
+        body.setOpenExternalLinks(True)
+        body.setWordWrap(True)
+        v.addWidget(body, 1)
+
+        self._cb_dont_ask = QCheckBox("Больше не показывать это окно")
+        v.addWidget(self._cb_dont_ask)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("Не сейчас")
+        btn_cancel.clicked.connect(self._on_dismiss)
+        btn_row.addWidget(btn_cancel)
+        if primary_label:
+            btn_primary = QPushButton(primary_label)
+            btn_primary.setObjectName("scan")
+            btn_primary.setDefault(True)
+            btn_primary.clicked.connect(self._on_primary)
+            btn_row.addWidget(btn_primary)
+        v.addLayout(btn_row)
+
+        self._stack.addWidget(page)
+
+    def _build_progress_page(self) -> None:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setSpacing(10)
+
+        title = QLabel("Загрузка установщика Nmap…")
+        f = QFont()
+        f.setPointSize(13)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #89b4fa;")
+        v.addWidget(title)
+
+        self._lbl_url = QLabel("")
+        self._lbl_url.setStyleSheet("color: #6c7086; font-family: Consolas;")
+        self._lbl_url.setWordWrap(True)
+        v.addWidget(self._lbl_url)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        v.addWidget(self._progress)
+
+        self._lbl_status = QLabel("Подготовка…")
+        self._lbl_status.setStyleSheet("color: #cdd6f4;")
+        v.addWidget(self._lbl_status)
+
+        v.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self._btn_cancel_dl = QPushButton("Отмена")
+        self._btn_cancel_dl.clicked.connect(self._on_cancel_download)
+        btn_row.addWidget(self._btn_cancel_dl)
+        v.addLayout(btn_row)
+
+        self._stack.addWidget(page)
+
+    def _build_done_page(self) -> None:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setSpacing(10)
+
+        title = QLabel("Установщик загружен")
+        f = QFont()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #a6e3a1;")
+        v.addWidget(title)
+
+        self._lbl_done = QLabel("")
+        self._lbl_done.setTextFormat(Qt.RichText)
+        self._lbl_done.setWordWrap(True)
+        v.addWidget(self._lbl_done, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        self._btn_launch = QPushButton("Запустить установщик")
+        self._btn_launch.setObjectName("scan")
+        self._btn_launch.setDefault(True)
+        self._btn_launch.clicked.connect(self._on_launch_installer)
+        btn_row.addWidget(self._btn_launch)
+        v.addLayout(btn_row)
+
+        self._stack.addWidget(page)
+
+    def _build_error_page(self) -> None:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setSpacing(10)
+
+        title = QLabel("Ошибка")
+        f = QFont()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #f38ba8;")
+        v.addWidget(title)
+
+        self._lbl_err = QLabel("")
+        self._lbl_err.setWordWrap(True)
+        self._lbl_err.setStyleSheet("color: #cdd6f4;")
+        v.addWidget(self._lbl_err, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        btn_retry = QPushButton("Повторить")
+        btn_retry.setObjectName("scan")
+        btn_retry.setDefault(True)
+        btn_retry.clicked.connect(self._on_retry)
+        btn_row.addWidget(btn_retry)
+        v.addLayout(btn_row)
+
+        self._stack.addWidget(page)
+
+    # -- handlers ----------------------------------------------------
+    def _on_dismiss(self) -> None:
+        self._save_dont_ask_pref()
+        self.reject()
+
+    def _on_primary(self) -> None:
+        self._save_dont_ask_pref()
+        if IS_WINDOWS:
+            self._start_download()
+        else:
+            self._launch_terminal_install()
+
+    def _save_dont_ask_pref(self) -> None:
+        if self._cb_dont_ask.isChecked():
+            settings = QSettings("IPbrowse", "IPbrowse")
+            settings.setValue(self.SETTINGS_KEY, True)
+
+    def _start_download(self) -> None:
+        try:
+            url, name = resolve_nmap_installer_url()
+        except Exception as exc:  # noqa: BLE001 — defensive; should not raise
+            self._show_error(f"Не удалось определить версию: {exc}")
+            return
+        target = Path(tempfile.gettempdir()) / "ipbrowse-nmap" / name
+        self._download_url = url
+        self._lbl_url.setText(url)
+        self._progress.setRange(0, 0)  # indeterminate until first chunk
+        self._lbl_status.setText("Подключение к nmap.org…")
+        self._stack.setCurrentIndex(1)
+
+        self._worker = NmapDownloadWorker(url, target)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.done.connect(self._on_download_ok)
+        self._worker.failed.connect(self._on_download_fail)
+        self._worker.start()
+
+    def _on_progress(self, done: int, total: int, kbps: float) -> None:
+        if total > 0:
+            if self._progress.maximum() != 100:
+                self._progress.setRange(0, 100)
+            pct = int(done * 100 / total)
+            self._progress.setValue(pct)
+            self._lbl_status.setText(
+                f"{done / (1024*1024):.1f} / {total / (1024*1024):.1f} МБ "
+                f"· {kbps:.0f} КБ/с"
+            )
+        else:
+            self._lbl_status.setText(
+                f"{done / (1024*1024):.1f} МБ · {kbps:.0f} КБ/с"
+            )
+
+    def _on_download_ok(self, path: str) -> None:
+        self._installer_path = path
+        self._cleanup_worker()
+        self._lbl_done.setText(
+            "Файл сохранён в:<br><code style=\"color:#a6e3a1;\">"
+            + path
+            + "</code><br><br>Нажмите «Запустить установщик», чтобы "
+            "продолжить (Windows запросит права администратора)."
+        )
+        self._btn_launch.setEnabled(True)
+        self._stack.setCurrentIndex(2)
+
+    def _on_download_fail(self, message: str) -> None:
+        self._cleanup_worker()
+        self._show_error(message)
+
+    def _show_error(self, message: str) -> None:
+        self._lbl_err.setText(message)
+        self._stack.setCurrentIndex(3)
+
+    def _on_cancel_download(self) -> None:
+        if self._worker is not None:
+            self._btn_cancel_dl.setEnabled(False)
+            self._lbl_status.setText("Отмена…")
+            self._worker.cancel()
+
+    def _on_launch_installer(self) -> None:
+        if not self._installer_path:
+            return
+        try:
+            if IS_WINDOWS and hasattr(os, "startfile"):
+                os.startfile(self._installer_path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen([self._installer_path])
+        except OSError as exc:
+            self._show_error(f"Не удалось запустить установщик: {exc}")
+            return
+        self.accept()
+
+    def _on_retry(self) -> None:
+        # Always send the user back to the prompt so they can either
+        # try again or cancel — implicit auto-retry is more annoying
+        # than helpful when the failure was a transient network error.
+        self._stack.setCurrentIndex(0)
+
+    def _launch_terminal_install(self) -> None:
+        pm = _detect_install_command()
+        if pm is None:
+            self._show_error(
+                "Не удалось определить пакетный менеджер. Установите "
+                "nmap вручную через штатные средства дистрибутива."
+            )
+            return
+        pm_name, pm_cmd = pm
+        if not _open_terminal_with(pm_cmd):
+            self._show_error(
+                "Не удалось открыть системный терминал. Запустите "
+                f"его вручную и выполните:\n\n    {pm_cmd}"
+            )
+            return
+        # The terminal runs detached — we can close the dialog immediately.
+        self.accept()
+
+    # -- lifecycle ---------------------------------------------------
+    def _cleanup_worker(self) -> None:
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.wait(2000)
+            worker.deleteLater()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 — Qt API
+        if self._worker is not None:
+            self._worker.cancel()
+            self._worker.wait(2000)
+        super().closeEvent(event)
+
+
+def maybe_offer_nmap_install(parent: QWidget) -> None:
+    """Show :class:`NmapInstallDialog` once if nmap is missing.
+
+    Honours the QSettings ``nmap/dont_ask_again`` flag the dialog
+    sets when the user ticks "больше не показывать". Safe to call
+    after every cold start — a no-op when nmap is on PATH.
+    """
+    if nmap_available():
+        return
+    settings = QSettings("IPbrowse", "IPbrowse")
+    if settings.value(NmapInstallDialog.SETTINGS_KEY, False, type=bool):
+        return
+    NmapInstallDialog(parent).exec()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -3236,6 +3821,13 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.about_tab, "О программе")
 
         self._apply_dark_theme()
+
+        # Defer the nmap-presence prompt until after the main window
+        # has actually painted; otherwise the modal dialog covers a
+        # blank background on slow Windows boxes and looks broken.
+        # 250 ms ≈ enough for the first idle cycle on every machine
+        # we've tested without making the user wait noticeably.
+        QTimer.singleShot(250, lambda: maybe_offer_nmap_install(self))
 
     def _apply_dark_theme(self) -> None:
         # The checked-state ``QCheckBox::indicator`` rule needs a real
