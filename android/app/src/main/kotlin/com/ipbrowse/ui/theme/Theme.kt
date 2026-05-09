@@ -1,7 +1,8 @@
 package com.ipbrowse.ui.theme
 
 import android.app.Activity
-import android.os.Build
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
@@ -66,6 +67,19 @@ private val IPbrowseTypography = Typography(
     labelLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontSize = 14.sp),
 )
 
+/**
+ * View.context может быть как Activity, так и ContextWrapper (например, под
+ * ComponentActivity Compose оборачивает контекст). Прямой cast к Activity
+ * валится с ClassCastException и убивает onCreate ещё до отрисовки —
+ * именно по этому экран был тёмно-синим без UI поверх. Аккуратно
+ * разворачиваем обёртки до настоящей Activity.
+ */
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 @Composable
 @Suppress("UNUSED_PARAMETER")
 fun IPbrowseTheme(
@@ -78,12 +92,17 @@ fun IPbrowseTheme(
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
-            val window = (view.context as Activity).window
-            window.statusBarColor = Catppuccin.Mantle.toArgb()
-            window.navigationBarColor = Catppuccin.Mantle.toArgb()
-            val controller = WindowCompat.getInsetsController(window, view)
-            controller.isAppearanceLightStatusBars = false
-            controller.isAppearanceLightNavigationBars = false
+            val activity = view.context.findActivity()
+            if (activity != null) {
+                val window = activity.window
+                @Suppress("DEPRECATION")
+                window.statusBarColor = Catppuccin.Mantle.toArgb()
+                @Suppress("DEPRECATION")
+                window.navigationBarColor = Catppuccin.Mantle.toArgb()
+                val controller = WindowCompat.getInsetsController(window, view)
+                controller.isAppearanceLightStatusBars = false
+                controller.isAppearanceLightNavigationBars = false
+            }
         }
     }
     MaterialTheme(

@@ -1,6 +1,5 @@
 package com.ipbrowse.ui
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -8,36 +7,38 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
-import androidx.compose.material3.TabRowDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ipbrowse.R
-import com.ipbrowse.scanner.WifiInfo
 import com.ipbrowse.ui.screens.AboutScreen
 import com.ipbrowse.ui.screens.MassScanScreen
 import com.ipbrowse.ui.screens.ScanScreen
 import com.ipbrowse.ui.screens.WifiScreen
 
 /**
- * Корневая Compose-обёртка: верхний TabRow с пятью вкладками + контент
- * текущей вкладки. Состояние каждой вкладки живёт в своём ViewModel'е,
- * которые `viewModel(key=...)` отделяет — иначе Local и External обе
- * получили бы один и тот же ScanViewModel и тёрли друг другу запуск.
+ * Корневая Compose-обёртка: верхний `ScrollableTabRow` с пятью вкладками +
+ * контент текущей вкладки. Состояние каждой вкладки живёт в своём
+ * ViewModel'е, которые `viewModel(key=...)` отделяет — иначе Local и
+ * External получили бы один и тот же `ScanViewModel` и тёрли друг другу
+ * запуск.
+ *
+ * `ScrollableTabRow` (а не `TabRow` с ручным horizontalScroll) важен:
+ * у обычного `TabRow` под scrollable-обёрткой нет конечной ширины и он
+ * падает при измерении — экран остаётся пустым, видим только цвет фона.
+ * `ScrollableTabRow` сам разруливает прокрутку, индикатор и edgePadding.
  */
 @Composable
 fun IPbrowseApp() {
@@ -55,47 +56,32 @@ fun IPbrowseApp() {
     val massVm: MassScanViewModel = viewModel()
     val wifiVm: WifiViewModel = viewModel()
 
-    // Подсказка для локальной вкладки: текущая /24 подсеть, если есть.
-    val context = LocalContext.current
-    val localDefaultTarget = remember {
-        WifiInfo.read(context).subnetCidr ?: "192.168.1.0/24"
+    // WifiInfo.read блокирует главный поток (NetworkInterface, ConnectivityManager),
+    // поэтому используем тот же ViewModel, что и Wi-Fi-вкладка — он уже
+    // вызывает read() через Dispatchers.IO. Реактивно подсовываем результат
+    // в дефолтную цель локальной вкладки.
+    val wifiState by wifiVm.state.collectAsState()
+    LaunchedEffect(wifiState.snapshot.subnetCidr) {
+        wifiState.snapshot.subnetCidr?.let { localVm.setDefaultTarget(it) }
     }
-    localVm.setDefaultTarget(localDefaultTarget)
 
     Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
-        val tabScrollState = rememberScrollState()
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(tabScrollState)
+        ScrollableTabRow(
+            selectedTabIndex = selected,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            edgePadding = 0.dp,
         ) {
-            // Tabs прокручиваем горизонтально на узких экранах: пять вкладок
-            // на русском не помещаются в 360dp (и не должны — перенос ломает
-            // выравнивание индикатора).
-            TabRow(
-                selectedTabIndex = selected,
-                modifier = Modifier.heightIn(min = 48.dp),
-                indicator = { tabPositions ->
-                    if (selected < tabPositions.size) {
-                        TabRowDefaults.SecondaryIndicator(
-                            modifier = Modifier
-                                .background(androidx.compose.material3.MaterialTheme.colorScheme.primary)
+            tabs.forEachIndexed { index, title ->
+                Tab(
+                    selected = selected == index,
+                    onClick = { selected = index },
+                    text = {
+                        Text(
+                            text = title,
+                            fontWeight = if (selected == index) FontWeight.Bold else FontWeight.Normal,
                         )
-                    }
-                },
-            ) {
-                tabs.forEachIndexed { index, title ->
-                    Tab(
-                        selected = selected == index,
-                        onClick = { selected = index },
-                        text = {
-                            Text(
-                                text = title,
-                                fontWeight = if (selected == index) FontWeight.Bold else FontWeight.Normal,
-                            )
-                        },
-                    )
-                }
+                    },
+                )
             }
         }
 
