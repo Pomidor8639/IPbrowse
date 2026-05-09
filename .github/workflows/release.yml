@@ -80,7 +80,13 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # Force bash on every runner so the Windows entry's
+      # ``--add-data ports.csv;.`` doesn't get split by PowerShell —
+      # PowerShell treats ``;`` as a statement separator and reruns
+      # the binary against ``app.py`` as a separate (failing)
+      # command.
       - name: Build with PyInstaller
+        shell: bash
         run: pyinstaller ${{ matrix.pyinstaller_args }}
 
       - name: Stage Windows binary
