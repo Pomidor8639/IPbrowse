@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Сканер должен иметь возможность открывать TCP-соединения к произвольным IP
+    в локальной подсети (включая plain HTTP / Telnet / SMB и т.п. — это и есть
+    штатный сценарий работы инструмента). Поэтому cleartext разрешён по
+    умолчанию. Сами TCP-сокеты создаются напрямую, network-security-config
+    влияет в первую очередь на HttpsURLConnection / WebView, но мы оставляем
+    его явным, чтобы поведение приложения было предсказуемым.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

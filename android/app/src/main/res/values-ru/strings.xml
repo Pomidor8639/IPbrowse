@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">IPbrowse</string>
+    <string name="tab_local">Локальная сеть</string>
+    <string name="tab_external">Внешние сети</string>
+    <string name="tab_wifi">Wi-Fi</string>
+    <string name="tab_mass">Массовое сканирование</string>
+    <string name="tab_about">О программе</string>
+</resources>

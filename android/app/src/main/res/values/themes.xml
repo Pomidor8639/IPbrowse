@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Базовая тема для splash до того, как Compose поднимется и
+         переопределит цвета через Material 3. -->
+    <style name="Theme.IPbrowse" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@color/cat_mantle</item>
+        <item name="android:navigationBarColor">@color/cat_mantle</item>
+        <item name="android:windowBackground">@color/cat_base</item>
+    </style>
+</resources>

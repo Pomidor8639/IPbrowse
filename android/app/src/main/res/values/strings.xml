@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Сборка по умолчанию ru: эти строки используются только если
+         система запросит en-локаль (см. resourceConfigurations). -->
+    <string name="app_name">IPbrowse</string>
+    <string name="tab_local">Local network</string>
+    <string name="tab_external">External</string>
+    <string name="tab_wifi">Wi-Fi</string>
+    <string name="tab_mass">Mass scan</string>
+    <string name="tab_about">About</string>
+</resources>

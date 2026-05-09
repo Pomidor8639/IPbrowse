@@ -19,3 +19,17 @@ _out.txt
 # Локальный контекст для AI-агентов / разработчиков, не для публичного
 # репозитория. Снят с трекинга через `git rm --cached AGENTS.md`.
 AGENTS.md
+
+# Android: локальные / build-артефакты, кэши Gradle
+android/local.properties
+android/.gradle/
+android/.idea/
+android/build/
+android/app/build/
+android/app/release/
+android/captures/
+android/.cxx/
+*.apk
+*.aab
+*.jks
+*.keystore

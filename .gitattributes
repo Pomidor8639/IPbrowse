@@ -1,0 +1,22 @@
+# Нормализация переводов строк: основная масса файлов — auto, чтобы git
+# сам решал по содержимому. Скрипты gradle wrapper / shell / sh должны
+# оставаться LF, иначе ломаются под Linux / macOS / WSL.
+
+* text=auto
+
+# Wrapper-скрипты Gradle: исходник в LF, никогда не CRLF.
+gradlew      text eol=lf
+*.sh         text eol=lf
+
+# Bat / cmd — наоборот, всегда CRLF под Windows.
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+
+# Бинарные файлы — никаких преобразований.
+*.jar        binary
+*.png        binary
+*.jpg        binary
+*.ico        binary
+*.icns       binary
+*.apk        binary
+*.aab        binary
