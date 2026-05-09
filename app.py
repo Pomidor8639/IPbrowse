@@ -3241,15 +3241,25 @@ def nmap_available() -> bool:
 def find_nmap_anywhere() -> Path | None:
     """Locate an installed ``nmap`` binary, even when PATH doesn't list it.
 
-    Searches in the following order:
+    Searches in roughly this order:
 
     1.  ``shutil.which`` against the live PATH (the happy path).
-    2.  Common installer directories — ``%ProgramFiles%\\Nmap``,
-        ``%ProgramFiles(x86)%\\Nmap``, Homebrew prefixes,
-        ``/snap/bin``, etc.
-    3.  Windows registry: the ``InstallLocation`` value under
-        ``HKLM\\…\\Uninstall\\Nmap`` that the official setup.exe
-        writes when it runs.
+    2.  Standard installer directories: ``%ProgramFiles%\\Nmap``,
+        ``%ProgramFiles(x86)%\\Nmap`` and the rarer
+        ``…\\Insecure.Org\\Nmap`` redistributions.
+    3.  Common third-party package managers — Chocolatey
+        (``%ChocolateyInstall%\\bin``,
+        ``…\\lib\\nmap\\tools``), Scoop (per-user and global
+        ``shims`` + ``apps\\nmap\\current``), WinGet
+        (``%LOCALAPPDATA%\\Microsoft\\WinGet\\Links``).
+    4.  Hand-rolled portable layouts: ``C:\\Tools\\nmap``,
+        ``C:\\Apps\\nmap``, plus a top-level ``Nmap`` /
+        ``Tools\\nmap`` / ``Apps\\nmap`` on every other lettered
+        drive — covers users who unzipped a portable nmap into a
+        custom partition.
+    5.  Windows registry: ``InstallLocation`` (or ``InstallDir`` /
+        ``Path``) under ``…\\Uninstall\\Nmap`` and
+        ``…\\Insecure.Org\\Nmap`` in both the 32- and 64-bit views.
 
     Returns the absolute path to the binary, or ``None`` if no
     ``nmap`` could be found anywhere.
@@ -3261,19 +3271,76 @@ def find_nmap_anywhere() -> Path | None:
     candidates: list[Path] = []
     if IS_WINDOWS:
         exe_name = "nmap.exe"
+
+        # 1. Standard installer directories (incl. an
+        # Insecure.Org redistribution variant).
         for env_key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
             base = os.environ.get(env_key)
             if base:
-                candidates.append(Path(base) / "Nmap" / exe_name)
-        # Last-ditch hardcoded fallbacks for unusual setups where
-        # the env vars are wiped (some sandboxes).
+                for sub in ("Nmap", r"Insecure.Org\Nmap"):
+                    candidates.append(Path(base) / sub / exe_name)
+
+        # 2. Hardcoded fallbacks (env vars sometimes wiped in
+        # sandboxes / repackaging tools).
+        for hard in (
+            r"C:\Program Files\Nmap",
+            r"C:\Program Files (x86)\Nmap",
+            r"C:\Program Files\Insecure.Org\Nmap",
+            r"C:\Program Files (x86)\Insecure.Org\Nmap",
+            r"C:\Nmap",
+            r"C:\nmap",
+            r"C:\Tools\nmap",
+            r"C:\Tools\Nmap",
+            r"C:\Apps\nmap",
+            r"C:\Apps\Nmap",
+            r"C:\Portable\nmap",
+            r"C:\Portable\Nmap",
+        ):
+            candidates.append(Path(hard) / exe_name)
+
+        # 3. Chocolatey: shim + lib package directories.
+        choco = os.environ.get(
+            "ChocolateyInstall", r"C:\ProgramData\chocolatey"
+        )
         candidates.extend([
-            Path(r"C:\Program Files\Nmap") / exe_name,
-            Path(r"C:\Program Files (x86)\Nmap") / exe_name,
+            Path(choco) / "bin" / exe_name,
+            Path(choco) / "lib" / "nmap" / "tools" / exe_name,
+            Path(choco) / "lib" / "nmap" / "tools" / "nmap" / exe_name,
         ])
-        # Registry lookup — Nmap's installer drops the install
-        # location into both 32-bit and 64-bit views of the
-        # uninstall hive depending on the OS bitness.
+
+        # 4. Scoop: per-user and globally-installed.
+        scoop_user = os.environ.get("SCOOP") or str(Path.home() / "scoop")
+        candidates.extend([
+            Path(scoop_user) / "shims" / exe_name,
+            Path(scoop_user) / "apps" / "nmap" / "current" / exe_name,
+        ])
+        scoop_global = os.environ.get(
+            "SCOOP_GLOBAL", r"C:\ProgramData\scoop"
+        )
+        candidates.extend([
+            Path(scoop_global) / "shims" / exe_name,
+            Path(scoop_global) / "apps" / "nmap" / "current" / exe_name,
+        ])
+
+        # 5. WinGet links (the synthetic shim folder it adds to
+        # PATH for unscoped portable apps).
+        local_app = os.environ.get(
+            "LOCALAPPDATA", str(Path.home() / "AppData" / "Local")
+        )
+        candidates.append(
+            Path(local_app) / "Microsoft" / "WinGet" / "Links" / exe_name
+        )
+
+        # 6. Top-level of every other drive — common pattern for
+        # users who unzip portable tools onto a secondary disk.
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            for sub in ("Nmap", "nmap", r"Tools\nmap", r"Apps\nmap"):
+                candidates.append(Path(f"{letter}:\\") / sub / exe_name)
+
+        # 7. Registry — Nmap's installer drops the install location
+        # into both 32-bit and 64-bit views of the uninstall hive.
+        # Some redistributions also write under
+        # ``Software\Insecure.Org\Nmap``.
         try:
             import winreg  # type: ignore[import-not-found]
 
@@ -3284,29 +3351,51 @@ def find_nmap_anywhere() -> Path | None:
                  r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Nmap"),
                 (winreg.HKEY_CURRENT_USER,
                  r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Nmap"),
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\Insecure.Org\Nmap"),
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\WOW6432Node\Insecure.Org\Nmap"),
+                (winreg.HKEY_CURRENT_USER,
+                 r"SOFTWARE\Insecure.Org\Nmap"),
             )
             for hive, subkey in reg_paths:
                 try:
                     with winreg.OpenKey(hive, subkey) as key:
-                        loc, _ = winreg.QueryValueEx(key, "InstallLocation")
-                        if loc:
-                            candidates.append(Path(loc) / exe_name)
+                        for value_name in (
+                            "InstallLocation", "InstallDir", "Path",
+                        ):
+                            try:
+                                loc, _ = winreg.QueryValueEx(key, value_name)
+                                if loc:
+                                    p = Path(loc)
+                                    if p.is_file():
+                                        candidates.append(p)
+                                    else:
+                                        candidates.append(p / exe_name)
+                            except OSError:
+                                continue
                 except OSError:
                     continue
         except ImportError:
             pass
     else:
-        # POSIX: package managers always put nmap somewhere on PATH,
-        # so this path matters mostly for hand-built / relocatable
-        # installs (`/opt/nmap-7.95/bin/nmap` and similar).
+        # POSIX: package managers normally put nmap on PATH already,
+        # so this list mostly matters for hand-built / relocatable
+        # installs (`/opt/nmap-7.95/bin/nmap`, `~/.local/bin`, …).
+        home = Path.home()
         candidates.extend([
             Path("/usr/local/bin/nmap"),
             Path("/usr/local/sbin/nmap"),
             Path("/opt/local/bin/nmap"),       # MacPorts
             Path("/opt/homebrew/bin/nmap"),    # Apple Silicon brew
+            Path("/opt/homebrew/sbin/nmap"),
             Path("/home/linuxbrew/.linuxbrew/bin/nmap"),
             Path("/snap/bin/nmap"),
             Path("/var/lib/snapd/snap/bin/nmap"),
+            Path("/usr/bin/nmap"),
+            Path("/bin/nmap"),
+            home / ".local" / "bin" / "nmap",
+            home / "bin" / "nmap",
         ])
 
     for cand in candidates:
@@ -3316,6 +3405,34 @@ def find_nmap_anywhere() -> Path | None:
         except OSError:
             continue
     return None
+
+
+def verify_nmap_binary(path: Path) -> bool:
+    """Quick sanity-check: is ``path`` actually an Nmap executable?
+
+    Runs ``<path> --version`` with a short timeout and looks for
+    the ``Nmap`` banner in stdout. Used by the manual-browse
+    flow so a user pointing at the wrong .exe ends in a clean
+    error rather than corrupting PATH.
+
+    The check is best-effort — antivirus / EDR products may block
+    the spawn or stall it long enough to time out, in which case
+    we err on the side of trusting the user (return True).
+    """
+    try:
+        result = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    except (OSError, ValueError):
+        return False
+    output = (result.stdout or "") + (result.stderr or "")
+    return "Nmap" in output
 
 
 def _nmap_version_key(v: str) -> tuple[int, ...]:
@@ -3718,6 +3835,16 @@ class NmapInstallDialog(QDialog):
         v.addWidget(self._cb_dont_ask)
 
         btn_row = QHBoxLayout()
+        # Manual browse goes on the LEFT — it's the answer to "у меня
+        # уже стоит nmap, но автопоиск не нашёл". Action buttons stay
+        # on the right where the user expects them.
+        btn_browse = QPushButton("Указать путь к nmap…")
+        btn_browse.clicked.connect(self._on_manual_browse)
+        btn_browse.setToolTip(
+            "Если nmap уже установлен, но IPbrowse его не нашёл — "
+            "укажите путь к nmap.exe вручную."
+        )
+        btn_row.addWidget(btn_browse)
         btn_row.addStretch(1)
         btn_cancel = QPushButton("Не сейчас")
         btn_cancel.clicked.connect(self._on_dismiss)
@@ -3845,6 +3972,70 @@ class NmapInstallDialog(QDialog):
             self._start_download()
         else:
             self._launch_terminal_install()
+
+    def _on_manual_browse(self) -> None:
+        """Let the user point at an existing nmap binary themselves.
+
+        Auto-detection covers the common installers + package
+        managers but inevitably misses someone's hand-rolled
+        portable layout. The browse fallback validates the choice
+        with :func:`verify_nmap_binary` and, on success, hands off
+        to :class:`NmapAddToPathDialog` so the user gets a normal
+        "add to PATH" flow rather than being forced through a
+        download they don't need.
+        """
+        if IS_WINDOWS:
+            file_filter = "nmap.exe (nmap.exe);;Все файлы (*)"
+            initial_dir = os.environ.get("ProgramFiles(x86)", "")
+        else:
+            file_filter = "Все файлы (*)"
+            initial_dir = "/usr/local/bin"
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Укажите расположение nmap",
+            initial_dir,
+            file_filter,
+        )
+        if not path_str:
+            return
+        chosen = Path(path_str)
+        if not chosen.is_file():
+            QMessageBox.warning(
+                self,
+                "Не удалось открыть файл",
+                f"Указанный путь не файл:\n{chosen}",
+            )
+            return
+        if not verify_nmap_binary(chosen):
+            keep = QMessageBox.question(
+                self,
+                "Не похоже на Nmap",
+                (
+                    f"<b>{chosen.name}</b> не вернул корректный "
+                    f"<code>--version</code> с упоминанием Nmap. "
+                    f"Возможно, это другой инструмент или антивирус "
+                    f"заблокировал запуск.<br><br>"
+                    f"Всё равно использовать этот путь?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if keep != QMessageBox.Yes:
+                return
+        # Save the suppression pref the same way the main button
+        # path does — the user finished the workflow regardless of
+        # which branch they took.
+        self._save_dont_ask_pref()
+        # Hand off to the path-fix dialog. Closing ourselves with
+        # ``accept()`` and scheduling the next dialog via QTimer
+        # avoids stacking modals (Qt is happier with sequential
+        # exec() calls than a re-entrant one).
+        self.accept()
+        parent = self.parentWidget()
+        QTimer.singleShot(
+            0,
+            lambda c=chosen, p=parent: NmapAddToPathDialog(c, p).exec(),
+        )
 
     def _save_dont_ask_pref(self) -> None:
         if self._cb_dont_ask.isChecked():

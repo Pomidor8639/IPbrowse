@@ -31,22 +31,34 @@ IPbrowse — настольный сканер локальной сети с GU
 - **Авто-установка Nmap.** На старте `maybe_offer_nmap_install`
   выбирает один из трёх сценариев:
   1. `shutil.which("nmap")` вернул путь — ничего не делаем.
-  2. Не на PATH, но найден через `find_nmap_anywhere()`
-     (стандартные каталоги установки + `HKLM\…\Uninstall\Nmap`
-     `InstallLocation`) — открывается `NmapAddToPathDialog`.
-     Под Windows кнопка «Добавить в PATH» дописывает каталог в
-     `HKCU\Environment\Path` (без админ-прав), шлёт
-     `WM_SETTINGCHANGE` и патчит `os.environ["PATH"]` текущего
+  2. Не на PATH, но найден через `find_nmap_anywhere()` — открывается
+     `NmapAddToPathDialog`. Под Windows кнопка «Добавить в PATH»
+     дописывает каталог в `HKCU\Environment\Path` (без админ-прав),
+     шлёт `WM_SETTINGCHANGE` и патчит `os.environ["PATH"]` текущего
      процесса — `shutil.which("nmap")` начинает работать сразу,
      без перезапуска. Под Linux/macOS кнопка «Скопировать команду»
      кладёт `export PATH="$PATH:/path/to/nmap"` в системный буфер.
-  3. Не нашли вообще — открывается `NmapInstallDialog`. Под Windows
-     он скачивает официальный setup.exe (последняя версия парсится
-     с `nmap.org/download.html`, fallback на `7.95`) и запускает
-     его — UAC поднимается автоматически. Под Linux / macOS
-     определяется пакетный менеджер (`apt` / `dnf` / `pacman` /
-     `brew` / …), системный терминал открывается с подставленной
-     командой `sudo … install nmap`.
+  3. Не нашли вообще — открывается `NmapInstallDialog`. У него на
+     prompt-странице есть кнопка **«Указать путь к nmap…»**: открывает
+     `QFileDialog`, проверяет файл через `verify_nmap_binary()`
+     (`<file> --version`, ищет «Nmap» в выводе) и, если ок, передаёт
+     его в `NmapAddToPathDialog` — это запасной выход для
+     нестандартных установок, которые автопоиск не покрывает.
+     Если пользователь подтверждает скачивание — Windows тянет
+     официальный setup.exe (последняя версия парсится с
+     `nmap.org/download.html`, fallback на `7.95`) и запускает
+     его. Linux/macOS — открывает терминал с подставленной командой
+     пакетного менеджера.
+  `find_nmap_anywhere()` сейчас покрывает: `%ProgramFiles%/Nmap` и
+  `…/Insecure.Org/Nmap`, Chocolatey (`%ChocolateyInstall%/bin`,
+  `…/lib/nmap/tools/`), Scoop (per-user и global `shims` +
+  `apps/nmap/current`), WinGet (`%LOCALAPPDATA%/Microsoft/WinGet/Links`),
+  `C:\Tools\nmap` / `C:\Apps\nmap` / `C:\Portable\nmap`, **корни
+  всех остальных букв дисков** (`D:\Nmap`, `E:\Nmap`, ... `Z:\Nmap`,
+  плюс `Tools\nmap` / `Apps\nmap` варианты), реестр (`Uninstall\Nmap`
+  + `Software\Insecure.Org\Nmap` в обоих видах). Если поиск всё ещё
+  кого-то пропускает — добавь путь сюда **и** оставь работать ручной
+  Browse-fallback.
   Оба диалога делят чекбокс «Больше не показывать» через
   `QSettings("IPbrowse", "IPbrowse")`, ключ `nmap/dont_ask_again`.
 
@@ -183,14 +195,21 @@ Spec-файл подключает `ports.csv` через `datas=[('ports.csv', 
 
 ## История значимых изменений (для контекста)
 
-- **Сейчас:** добавлен `NmapAddToPathDialog` для случая, когда
-  nmap уже установлен (`C:\Program Files (x86)\Nmap\nmap.exe`,
-  Homebrew, MacPorts, ...) но не на PATH. Кнопка «Добавить в PATH»
-  правит `HKCU\Environment\Path` через `winreg`, шлёт
-  `WM_SETTINGCHANGE` и патчит `os.environ["PATH"]` текущего
-  процесса. POSIX-вариант копирует `export PATH=...` в буфер
-  обмена. Поиск установленного nmap делает `find_nmap_anywhere()`
-  (Program Files / Homebrew / Snap + реестр Uninstall).
+- **Сейчас:** покрытие `find_nmap_anywhere()` существенно расширено
+  (Chocolatey, Scoop, WinGet, корни всех букв дисков, Insecure.Org
+  redistributions, реестр `Software\Insecure.Org\Nmap`). На
+  `NmapInstallDialog`-prompt добавлена кнопка «Указать путь к
+  nmap…» — открывает `QFileDialog`, проверяет файл через
+  `verify_nmap_binary()` (`<file> --version`) и передаёт в
+  `NmapAddToPathDialog`. Запасной путь для пользователей с
+  нестандартной установкой, которую автопоиск не покрывает.
+- Добавлен `NmapAddToPathDialog` для случая, когда nmap уже
+  установлен (`C:\Program Files (x86)\Nmap\nmap.exe`, Homebrew,
+  MacPorts, ...) но не на PATH. Кнопка «Добавить в PATH» правит
+  `HKCU\Environment\Path` через `winreg`, шлёт `WM_SETTINGCHANGE`
+  и патчит `os.environ["PATH"]` текущего процесса. POSIX-вариант
+  копирует `export PATH=...` в буфер обмена. Поиск установленного
+  nmap делает `find_nmap_anywhere()`.
 - Добавлена авто-установка Nmap. На старте, если `nmap` не на
   PATH, открывается `NmapInstallDialog`: Windows — скачивает и
   запускает официальный setup.exe (с прогресс-баром, скоростью и
