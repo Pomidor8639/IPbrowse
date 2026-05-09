@@ -9,6 +9,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,6 +39,7 @@ from PySide6.QtGui import (
     QIcon,
     QPainter,
     QPen,
+    QPixmap,
     QPolygonF,
 )
 from PySide6.QtWidgets import (
@@ -2847,16 +2849,21 @@ GITHUB_URL = "https://github.com/Pomidor8639/IPbrowse"
 
 
 def _google_search_url_for_port(port: int, proto: str = "tcp") -> str:
-    """Build a Google-search URL describing ``port`` / ``proto``.
+    """Build a Russian-language Google-search URL describing ``port`` / ``proto``.
 
     Intentionally a search URL rather than a direct Wikipedia / IANA
-    link: a plain ``port 22 tcp service`` query consistently surfaces
-    a Wikipedia page, the IANA registry entry, SpeedGuide, and recent
+    link: a plain ``что такое порт 22 tcp`` query consistently surfaces
+    a Russian Wikipedia page, IANA mirrors, SpeedGuide and recent
     security write-ups in the top results — which is what someone
-    investigating an unexpected open port actually wants.
+    investigating an unexpected open port actually wants. ``hl=ru``
+    forces the Google UI / SERP language to Russian even when the
+    user's browser default is English.
     """
-    query = f"port {port} {proto} service"
-    return "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+    query = f"что такое порт {port} {proto}"
+    return (
+        "https://www.google.com/search?hl=ru&q="
+        + urllib.parse.quote_plus(query)
+    )
 
 
 class AboutTab(QWidget):
@@ -2959,7 +2966,8 @@ class AboutTab(QWidget):
             "<b>Совет.</b> Кликните по строке хоста в любой вкладке "
             "сканирования и выберите пункт <i>«Порты…»</i> — откроется "
             "список открытых портов с расшифровкой сервиса и кнопкой "
-            "«Загуглить» для каждого порта."
+            "«Узнать больше» для каждого порта (открывает поиск Google "
+            "на русском языке)."
         )
         tip.setTextFormat(Qt.RichText)
         tip.setWordWrap(True)
@@ -3021,11 +3029,12 @@ class AboutTab(QWidget):
 class HostPortsDialog(QDialog):
     """Modal listing of open ports on a single host.
 
-    Per row: port, IANA service name, curated software hint, plus a
-    "Загуглить" button that fires a Google-search URL describing the
-    port. The button is implemented via ``QTreeWidget.setItemWidget``
-    so users can act on individual rows without having to first select
-    them — that's the exact friction the user asked us to remove.
+    Per row: port, IANA service name, curated software hint, plus an
+    "Узнать больше" button that fires a Russian-language Google-search
+    URL describing the port. The button is implemented via
+    ``QTreeWidget.setItemWidget`` so users can act on individual rows
+    without having to first select them — that's the exact friction
+    the user asked us to remove.
 
     The dialog is also useful when ``host.open_ports`` is empty: we
     show an explicit "Открытых портов не обнаружено" message so the
@@ -3075,8 +3084,8 @@ class HostPortsDialog(QDialog):
             "Список открытых TCP-портов на этом хосте. Колонка "
             "«Сервис» — имя из реестра IANA, «Софт» — типичные "
             "программы, которые слушают на этом порту. Кнопка "
-            "«Загуглить» открывает поиск с описанием порта в "
-            "браузере."
+            "«Узнать больше» открывает поиск Google на русском "
+            "языке с описанием порта в браузере."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: #94e2d5; font-style: italic;")
@@ -3098,7 +3107,7 @@ class HostPortsDialog(QDialog):
         # user wants a wide-net look (only enabled if there's at least
         # one port to act on — set in ``_populate``).
         btn_row = QHBoxLayout()
-        self.btn_google_all = QPushButton("Загуглить все")
+        self.btn_google_all = QPushButton("Узнать больше обо всех")
         self.btn_google_all.clicked.connect(self._google_all)
         self.btn_google_all.setEnabled(False)
         btn_row.addWidget(self.btn_google_all)
@@ -3129,7 +3138,7 @@ class HostPortsDialog(QDialog):
                 it.setToolTip(2, software)
             self.table.addTopLevelItem(it)
 
-            btn = QPushButton("Загуглить")
+            btn = QPushButton("Узнать больше")
             btn.setObjectName("scan")  # picks up the accent style
             btn.clicked.connect(
                 # Capture ``port`` by default-arg so each row's lambda
@@ -3148,6 +3157,48 @@ class HostPortsDialog(QDialog):
             QDesktopServices.openUrl(
                 QUrl(_google_search_url_for_port(port, "tcp"))
             )
+
+
+def _checkmark_icon_path() -> str:
+    """Return a forward-slash filesystem path to a 14x14 PNG checkmark.
+
+    QSS ``image: url(...)`` on ``QCheckBox::indicator:checked`` needs
+    a real image — solid-fill backgrounds were the previous look but
+    the user asked for an actual tick instead. Painting the tick
+    once into the OS temp directory avoids shipping a binary asset
+    in the repo *and* keeps the pixmap stable across sessions, which
+    means the QSS engine can cache it just like any bundled file.
+
+    Forward slashes are returned even on Windows because Qt's
+    stylesheet URL parser is happier with them and the resulting
+    rule looks identical regardless of the host OS.
+    """
+    cache = Path(tempfile.gettempdir()) / "ipbrowse_check_v2.png"
+    if not cache.exists():
+        pix = QPixmap(14, 14)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            # Catppuccin "blue" accent — high contrast against the
+            # dark Catppuccin Surface that backs the indicator.
+            pen = QPen(QColor("#89b4fa"))
+            pen.setWidth(2)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            # Classic check shape: short stroke down-right then long
+            # stroke up-right. Coordinates picked to centre the tick
+            # in a 14-px box with a bit of padding.
+            painter.drawPolyline(QPolygonF([
+                QPointF(2.5, 7.5),
+                QPointF(6.0, 11.0),
+                QPointF(11.0, 3.5),
+            ]))
+        finally:
+            painter.end()
+        pix.save(str(cache), "PNG")
+    return cache.as_posix()
 
 
 class MainWindow(QMainWindow):
@@ -3187,8 +3238,12 @@ class MainWindow(QMainWindow):
         self._apply_dark_theme()
 
     def _apply_dark_theme(self) -> None:
-        self.setStyleSheet(
-            """
+        # The checked-state ``QCheckBox::indicator`` rule needs a real
+        # PNG so that a checkmark is drawn on top of the otherwise
+        # hollow indicator. ``__CHECK_PATH__`` is a placeholder kept
+        # out of the QSS literal because every other brace in the
+        # stylesheet would otherwise need escaping under f-strings.
+        qss = """
             QWidget { background-color: #1e1e2e; color: #cdd6f4; font-size: 13px; }
             QGroupBox {
                 border: 1px solid #45475a; border-radius: 6px;
@@ -3230,12 +3285,16 @@ class MainWindow(QMainWindow):
             }
             QProgressBar::chunk { background: #a6e3a1; border-radius: 2px; }
             QCheckBox { spacing: 6px; }
-            QCheckBox::indicator { width: 14px; height: 14px; }
-            QCheckBox::indicator:unchecked {
+            QCheckBox::indicator {
+                width: 14px; height: 14px;
                 border: 1px solid #6c7086; background: #313244; border-radius: 3px;
             }
+            QCheckBox::indicator:hover { border: 1px solid #89b4fa; }
+            QCheckBox::indicator:unchecked { image: none; }
             QCheckBox::indicator:checked {
-                border: 1px solid #89b4fa; background: #89b4fa; border-radius: 3px;
+                border: 1px solid #89b4fa;
+                background: #313244;
+                image: url(__CHECK_PATH__);
             }
             QTabWidget::pane {
                 border: 1px solid #313244; border-radius: 4px; background: #1e1e2e;
@@ -3270,7 +3329,8 @@ class MainWindow(QMainWindow):
                 height: 1px; background: #45475a; margin: 4px 8px;
             }
             """
-        )
+        qss = qss.replace("__CHECK_PATH__", _checkmark_icon_path())
+        self.setStyleSheet(qss)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.local_tab.shutdown()
