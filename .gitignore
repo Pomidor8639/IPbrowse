@@ -15,3 +15,7 @@ dist/
 scan_results_*.csv
 scan_results_*.json
 _out.txt
+
+# Локальный контекст для AI-агентов / разработчиков, не для публичного
+# репозитория. Снят с трекинга через `git rm --cached AGENTS.md`.
+AGENTS.md
