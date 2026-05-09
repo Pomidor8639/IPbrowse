@@ -3238,6 +3238,86 @@ def nmap_available() -> bool:
     return shutil.which("nmap") is not None
 
 
+def find_nmap_anywhere() -> Path | None:
+    """Locate an installed ``nmap`` binary, even when PATH doesn't list it.
+
+    Searches in the following order:
+
+    1.  ``shutil.which`` against the live PATH (the happy path).
+    2.  Common installer directories — ``%ProgramFiles%\\Nmap``,
+        ``%ProgramFiles(x86)%\\Nmap``, Homebrew prefixes,
+        ``/snap/bin``, etc.
+    3.  Windows registry: the ``InstallLocation`` value under
+        ``HKLM\\…\\Uninstall\\Nmap`` that the official setup.exe
+        writes when it runs.
+
+    Returns the absolute path to the binary, or ``None`` if no
+    ``nmap`` could be found anywhere.
+    """
+    on_path = shutil.which("nmap")
+    if on_path:
+        return Path(on_path)
+
+    candidates: list[Path] = []
+    if IS_WINDOWS:
+        exe_name = "nmap.exe"
+        for env_key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            base = os.environ.get(env_key)
+            if base:
+                candidates.append(Path(base) / "Nmap" / exe_name)
+        # Last-ditch hardcoded fallbacks for unusual setups where
+        # the env vars are wiped (some sandboxes).
+        candidates.extend([
+            Path(r"C:\Program Files\Nmap") / exe_name,
+            Path(r"C:\Program Files (x86)\Nmap") / exe_name,
+        ])
+        # Registry lookup — Nmap's installer drops the install
+        # location into both 32-bit and 64-bit views of the
+        # uninstall hive depending on the OS bitness.
+        try:
+            import winreg  # type: ignore[import-not-found]
+
+            reg_paths = (
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Nmap"),
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Nmap"),
+                (winreg.HKEY_CURRENT_USER,
+                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Nmap"),
+            )
+            for hive, subkey in reg_paths:
+                try:
+                    with winreg.OpenKey(hive, subkey) as key:
+                        loc, _ = winreg.QueryValueEx(key, "InstallLocation")
+                        if loc:
+                            candidates.append(Path(loc) / exe_name)
+                except OSError:
+                    continue
+        except ImportError:
+            pass
+    else:
+        # POSIX: package managers always put nmap somewhere on PATH,
+        # so this path matters mostly for hand-built / relocatable
+        # installs (`/opt/nmap-7.95/bin/nmap` and similar).
+        candidates.extend([
+            Path("/usr/local/bin/nmap"),
+            Path("/usr/local/sbin/nmap"),
+            Path("/opt/local/bin/nmap"),       # MacPorts
+            Path("/opt/homebrew/bin/nmap"),    # Apple Silicon brew
+            Path("/home/linuxbrew/.linuxbrew/bin/nmap"),
+            Path("/snap/bin/nmap"),
+            Path("/var/lib/snapd/snap/bin/nmap"),
+        ])
+
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand.resolve()
+        except OSError:
+            continue
+    return None
+
+
 def _nmap_version_key(v: str) -> tuple[int, ...]:
     """Sort key for ``nmap-X.YZ`` style version strings."""
     return tuple(int(p) for p in v.split(".") if p.isdigit())
@@ -3358,6 +3438,118 @@ def _open_terminal_with(command: str) -> bool:
             except (OSError, FileNotFoundError):
                 continue
     return False
+
+
+def _windows_add_to_user_path(directory: Path) -> tuple[bool, str]:
+    """Append ``directory`` to ``HKCU\\Environment\\Path``.
+
+    Editing the per-user PATH does not require administrator
+    privileges, so this works without elevating IPbrowse. After
+    writing the registry we:
+
+    * broadcast ``WM_SETTINGCHANGE`` so explorer.exe / cmd / VS
+      Code refresh their environment without a relog;
+    * patch ``os.environ["PATH"]`` for the running Python process
+      so ``shutil.which("nmap")`` immediately returns truthy.
+
+    Returns ``(success, user_message)``. The function never raises;
+    on any registry / Win32 failure it returns ``(False, "...")``
+    so the caller can show the message in the error page.
+    """
+    if not IS_WINDOWS:
+        return (False, "Эта операция доступна только в Windows.")
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import winreg  # type: ignore[import-not-found]
+    except ImportError as exc:
+        return (False, f"Не удалось загрузить системные модули: {exc}")
+
+    dir_str = str(directory)
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            "Environment",
+            0,
+            winreg.KEY_READ | winreg.KEY_SET_VALUE,
+        ) as key:
+            try:
+                current, value_type = winreg.QueryValueEx(key, "Path")
+                # PATH is conventionally REG_EXPAND_SZ so users can
+                # use ``%USERPROFILE%`` etc.; if it's REG_SZ we
+                # preserve that to avoid surprising the user.
+                if value_type not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+                    value_type = winreg.REG_EXPAND_SZ
+            except FileNotFoundError:
+                current = ""
+                value_type = winreg.REG_EXPAND_SZ
+
+            entries = [e for e in current.split(";") if e]
+            already = False
+            target_resolved = directory.resolve()
+            for entry in entries:
+                if not entry or "%" in entry:
+                    # Don't try to resolve unexpanded placeholders;
+                    # comparing strings is enough to skip trivial
+                    # duplicates.
+                    if entry.strip().rstrip("\\").lower() == dir_str.rstrip("\\").lower():
+                        already = True
+                        break
+                    continue
+                try:
+                    if Path(entry).resolve() == target_resolved:
+                        already = True
+                        break
+                except OSError:
+                    continue
+
+            if already:
+                msg = "Каталог уже был в пользовательском PATH — изменения не нужны."
+            else:
+                entries.append(dir_str)
+                new_value = ";".join(entries)
+                winreg.SetValueEx(key, "Path", 0, value_type, new_value)
+                msg = (
+                    "Добавлено в пользовательский PATH:\n"
+                    f"  {dir_str}\n\n"
+                    "IPbrowse подхватила изменения сразу. Уже "
+                    "запущенные программы PATH не увидят, пока "
+                    "не будут перезапущены."
+                )
+
+        # Tell the system PATH has changed so cmd.exe / Explorer pick it up.
+        # SendMessageTimeoutW(HWND, UINT, WPARAM, LPCWSTR, UINT, UINT, PDWORD)
+        SendMessageTimeoutW = ctypes.windll.user32.SendMessageTimeoutW
+        SendMessageTimeoutW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPCWSTR,
+            wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.DWORD),
+        ]
+        SendMessageTimeoutW.restype = ctypes.c_long
+        result = wintypes.DWORD(0)
+        try:
+            SendMessageTimeoutW(
+                wintypes.HWND(0xFFFF),  # HWND_BROADCAST
+                wintypes.UINT(0x001A),  # WM_SETTINGCHANGE
+                wintypes.WPARAM(0),
+                "Environment",
+                wintypes.UINT(0x0002),  # SMTO_ABORTIFHUNG
+                wintypes.UINT(5000),
+                ctypes.byref(result),
+            )
+        except OSError:
+            # Broadcast is best-effort — failing here doesn't mean
+            # the registry write failed.
+            pass
+
+        # Patch live PATH so ``shutil.which`` finds nmap right now.
+        sep = os.pathsep
+        cur = os.environ.get("PATH", "")
+        if dir_str.lower() not in cur.lower().split(sep):
+            os.environ["PATH"] = (cur + sep + dir_str) if cur else dir_str
+
+        return (True, msg)
+    except OSError as exc:
+        return (False, f"Не удалось записать в реестр HKCU\\Environment: {exc}")
 
 
 class NmapDownloadWorker(QThread):
@@ -3771,17 +3963,267 @@ class NmapInstallDialog(QDialog):
         super().closeEvent(event)
 
 
-def maybe_offer_nmap_install(parent: QWidget) -> None:
-    """Show :class:`NmapInstallDialog` once if nmap is missing.
+class NmapAddToPathDialog(QDialog):
+    """Modal: nmap is installed but its directory isn't on PATH.
 
-    Honours the QSettings ``nmap/dont_ask_again`` flag the dialog
-    sets when the user ticks "больше не показывать". Safe to call
-    after every cold start — a no-op when nmap is on PATH.
+    The Nmap installer optionally adds itself to the system PATH —
+    if the user dismissed that step (or the box wasn't ticked) the
+    binary lives at e.g. ``C:\\Program Files (x86)\\Nmap\\nmap.exe``
+    but typing ``nmap`` in cmd / PowerShell yields "command not
+    found". IPbrowse itself doesn't care — its scanner is pure
+    Python — but tools the user may want to drive (Zenmap, scripts)
+    *do*. This dialog offers a one-click PATH fix.
+
+    States:
+
+    ====== =====================================================
+    index  page
+    ====== =====================================================
+    0      prompt — "found at X, не в PATH" + Add / Not now /
+           don't-ask
+    1      done — confirmation message
+    2      error — error text + Retry
+    ====== =====================================================
+
+    POSIX: HKCU is Windows-only, so the primary action is replaced
+    with "Скопировать команду" — the user pastes
+    ``export PATH="$PATH:/path/to/nmap"`` into their shell rc.
+    """
+
+    SETTINGS_KEY = "nmap/dont_ask_again"  # shared with install dialog
+
+    def __init__(self, found: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Nmap не в PATH")
+        self.setModal(True)
+        self.resize(600, 320)
+
+        self._found = found
+        self._dir = found.parent
+
+        self._stack = QStackedWidget(self)
+        self._build_prompt_page()
+        self._build_done_page()
+        self._build_error_page()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.addWidget(self._stack, 1)
+        self._stack.setCurrentIndex(0)
+
+    # -- pages -------------------------------------------------------
+    def _build_prompt_page(self) -> None:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setSpacing(10)
+
+        title = QLabel("Nmap найден, но не в PATH")
+        f = QFont()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #f9e2af;")
+        v.addWidget(title)
+
+        if IS_WINDOWS:
+            body_text = (
+                f"Файл <code>{self._found.name}</code> найден по пути:"
+                f"<br><code style=\"color:#a6e3a1;\">{self._found}</code>"
+                f"<br><br>"
+                "Сама IPbrowse работает и без PATH, но команды "
+                "<code>nmap</code> и <code>zenmap</code> в "
+                "командной строке не запустятся, пока их каталог "
+                "не в <code>PATH</code>. Можно добавить директорию "
+                "в <b>пользовательский</b> PATH прямо сейчас — это "
+                "не требует прав администратора, и изменения "
+                "применятся сразу."
+            )
+            primary_label = "Добавить в PATH"
+        else:
+            export_cmd = f'export PATH="$PATH:{self._dir}"'
+            body_text = (
+                f"Файл <code>{self._found.name}</code> найден по пути:"
+                f"<br><code style=\"color:#a6e3a1;\">{self._found}</code>"
+                f"<br><br>"
+                f"Каталог <code>{self._dir}</code> не в "
+                f"<code>$PATH</code>. Чтобы команда "
+                f"<code>nmap</code> заработала в терминале, "
+                f"добавьте строку в свой <code>~/.bashrc</code>, "
+                f"<code>~/.zshrc</code> или эквивалентный файл "
+                f"конфигурации шелла:<br><br>"
+                f"<code style=\"color:#a6e3a1;\">{export_cmd}</code>"
+            )
+            primary_label = "Скопировать команду"
+
+        self._lbl_body = QLabel(body_text)
+        self._lbl_body.setTextFormat(Qt.RichText)
+        self._lbl_body.setWordWrap(True)
+        v.addWidget(self._lbl_body, 1)
+
+        self._cb_dont_ask = QCheckBox("Больше не показывать это окно")
+        v.addWidget(self._cb_dont_ask)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_dismiss = QPushButton("Не сейчас")
+        btn_dismiss.clicked.connect(self._on_dismiss)
+        btn_row.addWidget(btn_dismiss)
+        btn_primary = QPushButton(primary_label)
+        btn_primary.setObjectName("scan")
+        btn_primary.setDefault(True)
+        btn_primary.clicked.connect(self._on_primary)
+        btn_row.addWidget(btn_primary)
+        v.addLayout(btn_row)
+
+        self._stack.addWidget(page)
+
+    def _build_done_page(self) -> None:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setSpacing(10)
+
+        title = QLabel("Готово")
+        f = QFont()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #a6e3a1;")
+        v.addWidget(title)
+
+        self._lbl_done = QLabel("")
+        self._lbl_done.setTextFormat(Qt.PlainText)
+        self._lbl_done.setWordWrap(True)
+        self._lbl_done.setStyleSheet("color: #cdd6f4;")
+        v.addWidget(self._lbl_done, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QPushButton("Закрыть")
+        btn_close.setDefault(True)
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        v.addLayout(btn_row)
+
+        self._stack.addWidget(page)
+
+    def _build_error_page(self) -> None:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setSpacing(10)
+
+        title = QLabel("Ошибка")
+        f = QFont()
+        f.setPointSize(14)
+        f.setBold(True)
+        title.setFont(f)
+        title.setStyleSheet("color: #f38ba8;")
+        v.addWidget(title)
+
+        self._lbl_err = QLabel("")
+        self._lbl_err.setWordWrap(True)
+        self._lbl_err.setStyleSheet("color: #cdd6f4;")
+        v.addWidget(self._lbl_err, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_close = QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        btn_row.addWidget(btn_close)
+        btn_back = QPushButton("Назад")
+        btn_back.setObjectName("scan")
+        btn_back.setDefault(True)
+        btn_back.clicked.connect(lambda: self._stack.setCurrentIndex(0))
+        btn_row.addWidget(btn_back)
+        v.addLayout(btn_row)
+
+        self._stack.addWidget(page)
+
+    # -- handlers ----------------------------------------------------
+    def _on_dismiss(self) -> None:
+        self._save_dont_ask_pref()
+        self.reject()
+
+    def _on_primary(self) -> None:
+        self._save_dont_ask_pref()
+        if IS_WINDOWS:
+            self._add_to_path_windows()
+        else:
+            self._copy_export_to_clipboard()
+
+    def _save_dont_ask_pref(self) -> None:
+        if self._cb_dont_ask.isChecked():
+            settings = QSettings("IPbrowse", "IPbrowse")
+            settings.setValue(self.SETTINGS_KEY, True)
+
+    def _add_to_path_windows(self) -> None:
+        ok, message = _windows_add_to_user_path(self._dir)
+        if not ok:
+            self._lbl_err.setText(message)
+            self._stack.setCurrentIndex(2)
+            return
+        # Re-verify: PATH was patched in-process, so shutil.which
+        # should now find nmap. If it doesn't, surface the failure
+        # so the user knows something is still wrong.
+        verify = shutil.which("nmap")
+        if verify is None:
+            self._lbl_err.setText(
+                "PATH обновлён в реестре, но IPbrowse всё ещё не "
+                "видит nmap в текущей сессии. Перезапустите "
+                "программу — изменение применится автоматически."
+            )
+            self._stack.setCurrentIndex(2)
+            return
+        self._lbl_done.setText(
+            message + f"\n\nПроверка: shutil.which(\"nmap\") -> {verify}"
+        )
+        self._stack.setCurrentIndex(1)
+
+    def _copy_export_to_clipboard(self) -> None:
+        cmd = f'export PATH="$PATH:{self._dir}"'
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is None:
+            self._lbl_err.setText(
+                "Не удалось получить буфер обмена. Скопируйте "
+                f"строку вручную:\n\n    {cmd}"
+            )
+            self._stack.setCurrentIndex(2)
+            return
+        clipboard.setText(cmd)
+        self._lbl_done.setText(
+            "Команда скопирована в буфер обмена:\n\n"
+            f"    {cmd}\n\n"
+            "Вставьте её в свой ~/.bashrc / ~/.zshrc и "
+            "перезапустите терминал."
+        )
+        self._stack.setCurrentIndex(1)
+
+
+def maybe_offer_nmap_install(parent: QWidget) -> None:
+    """Pick the right startup nmap-state dialog (or none).
+
+    Three branches:
+
+    *  ``shutil.which("nmap")`` finds an executable — IPbrowse has
+       nothing to do, return early.
+    *  Nmap is *installed* but its directory isn't in PATH (the
+       common Windows-installer-with-PATH-checkbox-unticked case)
+       — show :class:`NmapAddToPathDialog` so the user can fix it
+       in one click.
+    *  Nmap isn't on disk anywhere we know to look — fall back to
+       :class:`NmapInstallDialog` to download / install it.
+
+    Both dialogs share a single QSettings flag
+    (``nmap/dont_ask_again``) so the user only has to dismiss
+    once across launches.
     """
     if nmap_available():
         return
     settings = QSettings("IPbrowse", "IPbrowse")
     if settings.value(NmapInstallDialog.SETTINGS_KEY, False, type=bool):
+        return
+    found = find_nmap_anywhere()
+    if found is not None:
+        NmapAddToPathDialog(found, parent).exec()
         return
     NmapInstallDialog(parent).exec()
 
